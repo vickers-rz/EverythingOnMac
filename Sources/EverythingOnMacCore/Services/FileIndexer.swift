@@ -30,7 +30,7 @@ public actor FileIndexer {
                 continue
             }
 
-            for case let fileURL as URL in enumerator {
+            while let fileURL = enumerator.nextObject() as? URL {
                 if shouldExclude(fileURL.path) {
                     enumerator.skipDescendants()
                     continue

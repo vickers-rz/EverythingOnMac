@@ -3,6 +3,7 @@ import PackageDescription
 
 let package = Package(
     name: "EverythingOnMac",
+    platforms: [.macOS(.v14)],
     products: [
         .executable(name: "EverythingOnMac", targets: ["EverythingOnMac"]),
         .library(name: "EverythingOnMacCore", targets: ["EverythingOnMacCore"]),

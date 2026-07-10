@@ -71,8 +71,9 @@ public enum APFSVolumeInspector {
         guard root.withUnsafeFileSystemRepresentation({ statfs($0, &stats) }) == 0 else {
             return nil
         }
+        let capacity = MemoryLayout.size(ofValue: stats.f_fstypename)
         return withUnsafePointer(to: &stats.f_fstypename) { pointer in
-            pointer.withMemoryRebound(to: CChar.self, capacity: MemoryLayout.size(ofValue: stats.f_fstypename)) { cString in
+            pointer.withMemoryRebound(to: CChar.self, capacity: capacity) { cString in
                 String(cString: cString)
             }
         }
