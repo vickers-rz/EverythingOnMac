@@ -1,0 +1,118 @@
+import Foundation
+
+public struct IndexerConfiguration: Sendable {
+    public var roots: [URL]
+    public var excludedPaths: [String]
+
+    public init(roots: [URL], excludedPaths: [String] = []) {
+        self.roots = roots
+        self.excludedPaths = excludedPaths
+    }
+}
+
+public actor FileIndexer {
+    private var files: [String: FileMetadata] = [:]
+    private let configuration: IndexerConfiguration
+
+    public init(configuration: IndexerConfiguration) {
+        self.configuration = configuration
+    }
+
+    public func rebuild() async {
+        var updated: [String: FileMetadata] = [:]
+
+        for root in configuration.roots {
+            guard let enumerator = FileManager.default.enumerator(
+                at: root,
+                includingPropertiesForKeys: [.isRegularFileKey, .fileSizeKey, .contentModificationDateKey, .fileResourceIdentifierKey, .typeIdentifierKey],
+                options: [.skipsPackageDescendants, .skipsHiddenFiles]
+            ) else {
+                continue
+            }
+
+            for case let fileURL as URL in enumerator {
+                if shouldExclude(fileURL.path) {
+                    enumerator.skipDescendants()
+                    continue
+                }
+
+                guard let values = try? fileURL.resourceValues(forKeys: [.isRegularFileKey, .fileSizeKey, .contentModificationDateKey, .fileResourceIdentifierKey, .typeIdentifierKey]),
+                      values.isRegularFile == true
+                else {
+                    continue
+                }
+
+                let metadata = FileMetadata(
+                    path: fileURL.path,
+                    filename: fileURL.lastPathComponent,
+                    fileExtension: fileURL.pathExtension.lowercased(),
+                    size: Int64(values.fileSize ?? 0),
+                    modificationDate: values.contentModificationDate,
+                    fileID: normalizeFileID(values.fileResourceIdentifier),
+                    uti: values.typeIdentifier
+                )
+                updated[fileURL.path] = metadata
+            }
+        }
+
+        files = updated
+    }
+
+    public func query(_ query: SearchQuery) async -> [SearchResult] {
+        files.values.compactMap { metadata in
+            guard matches(metadata, query: query) else {
+                return nil
+            }
+            return SearchResult(metadata: metadata, source: [.filenameIndex])
+        }
+        .sorted { $0.metadata.path < $1.metadata.path }
+    }
+
+    public func itemCount() async -> Int {
+        files.count
+    }
+
+    private func shouldExclude(_ path: String) -> Bool {
+        configuration.excludedPaths.contains { path.hasPrefix($0) }
+    }
+
+    private func matches(_ metadata: FileMetadata, query: SearchQuery) -> Bool {
+        if let pathPrefix = query.pathPrefix, !metadata.path.contains(pathPrefix) {
+            return false
+        }
+
+        if !query.fileExtensions.isEmpty,
+           !query.fileExtensions.contains(metadata.fileExtension.lowercased()) {
+            return false
+        }
+
+        for excluded in query.excludedTerms where localizedContains(metadata.filename, excluded, caseSensitive: query.isCaseSensitive) {
+            return false
+        }
+
+        if query.terms.isEmpty {
+            return true
+        }
+
+        return query.terms.allSatisfy { term in
+            localizedContains(metadata.filename, term, caseSensitive: query.isCaseSensitive)
+            || localizedContains(metadata.path, term, caseSensitive: query.isCaseSensitive)
+        }
+    }
+
+    private func localizedContains(_ source: String, _ term: String, caseSensitive: Bool) -> Bool {
+        if caseSensitive {
+            return source.contains(term)
+        }
+        return source.localizedCaseInsensitiveContains(term)
+    }
+
+    private func normalizeFileID(_ identifier: Any?) -> UInt64? {
+        switch identifier {
+        case let number as NSNumber:
+            return number.uint64Value
+        default:
+            return nil
+        }
+    }
+}
