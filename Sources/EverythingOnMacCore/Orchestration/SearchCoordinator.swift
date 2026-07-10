@@ -75,6 +75,7 @@ public actor SearchCoordinator {
                         indexed = queryResult.results
                         skippedCorruptNodeCount = queryResult.skippedCorruptNodeCount
                         firstCorruptionDescription = queryResult.firstCorruptionDescription
+                        indexWasTruncated = indexWasTruncated || queryResult.candidateScanLimitReached
                         if indexed.count > candidateLimit {
                             indexWasTruncated = true
                             indexed.removeLast(indexed.count - candidateLimit)

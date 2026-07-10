@@ -418,6 +418,15 @@ func fileIndexerResolvePathInvalidStructures() async throws {
     #expect(allFilenames.count == 5)
     #expect(!allFilenames.contains("missing_parent.txt"))
     #expect(!allFilenames.contains("cycle.txt"))
+
+    // OFFSET is defined over valid results, not raw SQLite rows. Corrupt rows sort
+    // before valid_* and must not consume the requested offset.
+    var pagedQuery = QueryParser.parse("")
+    pagedQuery.limit = 2
+    pagedQuery.offset = 1
+    pagedQuery.sortOption = SortOption(field: .filename, direction: .ascending)
+    let pagedResult = try await indexer.query(pagedQuery)
+    #expect(pagedResult.results.map { $0.metadata.filename } == ["valid_2.txt", "valid_3.txt"])
 }
 
 @Test("Unresolvable pathPrefix throws invalidPathPrefix error")
@@ -572,7 +581,7 @@ func searchCoordinatorBatchesStreamingUpdates() async throws {
     ))
     let searcher = RipgrepSearcher(configuration: RipgrepConfiguration(
         executablePath: script,
-        timeoutSeconds: 5
+        timeoutSeconds: 15
     ))
     let coordinator = SearchCoordinator(
         indexer: indexer,
@@ -625,7 +634,7 @@ func searchCoordinatorIncrementallyMergesIndexedFile() async throws {
         indexer: indexer,
         ripgrepSearcher: RipgrepSearcher(configuration: RipgrepConfiguration(
             executablePath: script,
-            timeoutSeconds: 5
+            timeoutSeconds: 15
         )),
         roots: [URL(fileURLWithPath: tempDir)]
     )

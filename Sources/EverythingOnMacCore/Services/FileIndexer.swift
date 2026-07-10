@@ -67,11 +67,18 @@ public struct FileIndexQueryResult: Sendable, Equatable {
     public let results: [SearchResult]
     public let skippedCorruptNodeCount: Int
     public let firstCorruptionDescription: String?
+    public let candidateScanLimitReached: Bool
 
-    public init(results: [SearchResult], skippedCorruptNodeCount: Int, firstCorruptionDescription: String?) {
+    public init(
+        results: [SearchResult],
+        skippedCorruptNodeCount: Int,
+        firstCorruptionDescription: String?,
+        candidateScanLimitReached: Bool = false
+    ) {
         self.results = results
         self.skippedCorruptNodeCount = skippedCorruptNodeCount
         self.firstCorruptionDescription = firstCorruptionDescription
+        self.candidateScanLimitReached = candidateScanLimitReached
     }
 }
 
@@ -465,6 +472,11 @@ public actor FileIndexer {
                           let parentIDValue = row["parent_id"] as? Int64,
                           let name = row["name"] as? String,
                           row["is_directory"] is Int64 else {
+                        skippedCount += 1
+                        if firstCorruption == nil {
+                            firstCorruption = "查询结果包含缺失或类型异常的必要字段。"
+                        }
+                        logger.warning("Skipping malformed index row while resolving paths.")
                         continue
                     }
 
@@ -522,33 +534,51 @@ public actor FileIndexer {
                     firstCorruptionDescription: firstCorruption
                 )
             } else {
-                // Non-path sorting: we can use SQLite LIMIT/OFFSET, but when we encounter skipped nodes,
-                // we query additional rows to back-fill up to the targetLimit.
-                var currentDatabaseOffset = queryOffset
+                // OFFSET must apply to valid, resolvable results rather than raw SQLite rows.
+                // Read from the beginning in bounded batches, skip valid rows until queryOffset,
+                // then collect targetLimit rows while transparently back-filling corrupt entries.
+                var currentDatabaseOffset = 0
+                var validToSkip = queryOffset
                 var validNeeded = targetLimit
                 let safetyMaxRows = 50_000
                 var totalRowsProcessed = 0
+                var databaseExhausted = false
 
-                while validNeeded > 0 && totalRowsProcessed < safetyMaxRows {
+                while validNeeded > 0 && totalRowsProcessed < safetyMaxRows && !databaseExhausted {
                     try Task.checkCancellation()
 
+                    let remainingSafetyRows = safetyMaxRows - totalRowsProcessed
+                    let requestedBatchSize = min(
+                        max(256, validToSkip + validNeeded),
+                        remainingSafetyRows
+                    )
                     let batchSQL = sql + " LIMIT ? OFFSET ?;"
                     var batchBindings = bindings
-                    batchBindings.append(validNeeded)
+                    batchBindings.append(requestedBatchSize)
                     batchBindings.append(currentDatabaseOffset)
 
-                    let rows = try database.query(sql: cte.isEmpty ? batchSQL : cte + "\n" + batchSQL, bindings: batchBindings)
+                    let rows = try database.query(
+                        sql: cte.isEmpty ? batchSQL : cte + "\n" + batchSQL,
+                        bindings: batchBindings
+                    )
                     if rows.isEmpty {
-                        break // No more rows in database
+                        databaseExhausted = true
+                        break
                     }
 
                     for row in rows {
+                        try Task.checkCancellation()
                         totalRowsProcessed += 1
                         guard let volumeUUID = row["volume_uuid"] as? String,
                               let fileIDValue = row["file_id"] as? Int64,
                               let parentIDValue = row["parent_id"] as? Int64,
                               let name = row["name"] as? String,
                               row["is_directory"] is Int64 else {
+                            skippedCount += 1
+                            if firstCorruption == nil {
+                                firstCorruption = "查询结果包含缺失或类型异常的必要字段。"
+                            }
+                            logger.warning("Skipping malformed index row while resolving paths.")
                             continue
                         }
 
@@ -567,6 +597,11 @@ public actor FileIndexer {
                             }
                             guard !shouldExclude(fullPath) else { continue }
 
+                            if validToSkip > 0 {
+                                validToSkip -= 1
+                                continue
+                            }
+
                             results.append(SearchResult(
                                 metadata: FileMetadata(
                                     path: fullPath,
@@ -580,6 +615,7 @@ public actor FileIndexer {
                                 source: [.filenameIndex]
                             ))
                             validNeeded -= 1
+                            if validNeeded == 0 { break }
                         } catch {
                             skippedCount += 1
                             if firstCorruption == nil {
@@ -590,15 +626,14 @@ public actor FileIndexer {
                     }
 
                     currentDatabaseOffset += rows.count
-                    if rows.count < validNeeded {
-                        break // SQLite returned fewer rows than requested, database is exhausted
-                    }
+                    databaseExhausted = rows.count < requestedBatchSize
                 }
 
                 return FileIndexQueryResult(
                     results: results,
                     skippedCorruptNodeCount: skippedCount,
-                    firstCorruptionDescription: firstCorruption
+                    firstCorruptionDescription: firstCorruption,
+                    candidateScanLimitReached: validNeeded > 0 && !databaseExhausted && totalRowsProcessed >= safetyMaxRows
                 )
             }
         } catch let error as FileIndexSearchError {
