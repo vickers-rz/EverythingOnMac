@@ -42,16 +42,9 @@ public actor FileIndexer {
                     continue
                 }
 
-                let metadata = FileMetadata(
-                    path: fileURL.path,
-                    filename: fileURL.lastPathComponent,
-                    fileExtension: fileURL.pathExtension.lowercased(),
-                    size: Int64(values.fileSize ?? 0),
-                    modificationDate: values.contentModificationDate,
-                    fileID: normalizeFileID(values.fileResourceIdentifier),
-                    uti: values.typeIdentifier
-                )
-                updated[fileURL.path] = metadata
+                if let metadata = metadata(for: fileURL, resourceValues: values) {
+                    updated[fileURL.path] = metadata
+                }
             }
         }
 
@@ -72,8 +65,36 @@ public actor FileIndexer {
         files.count
     }
 
+    public func upsert(path: String) async {
+        guard !shouldExclude(path), let metadata = metadata(for: URL(fileURLWithPath: path)) else {
+            files.removeValue(forKey: path)
+            return
+        }
+        files[path] = metadata
+    }
+
+    public func remove(path: String) async {
+        files.removeValue(forKey: path)
+    }
+
     private func shouldExclude(_ path: String) -> Bool {
         configuration.excludedPaths.contains { path.hasPrefix($0) }
+    }
+
+    private func metadata(for fileURL: URL, resourceValues values: URLResourceValues? = nil) -> FileMetadata? {
+        let keys: Set<URLResourceKey> = [.isRegularFileKey, .fileSizeKey, .contentModificationDateKey, .fileResourceIdentifierKey, .typeIdentifierKey]
+        let resolvedValues = values ?? (try? fileURL.resourceValues(forKeys: keys))
+        guard resolvedValues?.isRegularFile == true else { return nil }
+
+        return FileMetadata(
+            path: fileURL.path,
+            filename: fileURL.lastPathComponent,
+            fileExtension: fileURL.pathExtension.lowercased(),
+            size: Int64(resolvedValues?.fileSize ?? 0),
+            modificationDate: resolvedValues?.contentModificationDate,
+            fileID: normalizeFileID(resolvedValues?.fileResourceIdentifier),
+            uti: resolvedValues?.typeIdentifier
+        )
     }
 
     private func matches(_ metadata: FileMetadata, query: SearchQuery) -> Bool {
