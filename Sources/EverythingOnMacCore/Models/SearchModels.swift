@@ -113,13 +113,25 @@ public struct SearchQuery: Sendable, Equatable {
     }
 }
 
+public struct FileIdentity: Sendable, Hashable {
+    public let volumeUUID: String
+    public let fileID: UInt64
+
+    public init(volumeUUID: String, fileID: UInt64) {
+        self.volumeUUID = volumeUUID
+        self.fileID = fileID
+    }
+}
+
 public struct FileMetadata: Sendable, Hashable {
     public var path: String
     public var filename: String
     public var fileExtension: String
     public var size: Int64
     public var modificationDate: Date?
+    public var volumeUUID: String?
     public var fileID: UInt64?
+    public var entryID: Int64?
     public var uti: String?
 
     public init(
@@ -128,7 +140,9 @@ public struct FileMetadata: Sendable, Hashable {
         fileExtension: String,
         size: Int64,
         modificationDate: Date?,
+        volumeUUID: String? = nil,
         fileID: UInt64?,
+        entryID: Int64? = nil,
         uti: String?
     ) {
         self.path = path
@@ -136,8 +150,15 @@ public struct FileMetadata: Sendable, Hashable {
         self.fileExtension = fileExtension
         self.size = size
         self.modificationDate = modificationDate
+        self.volumeUUID = volumeUUID
         self.fileID = fileID
+        self.entryID = entryID
         self.uti = uti
+    }
+
+    public var identity: FileIdentity? {
+        guard let volumeUUID, let fileID else { return nil }
+        return FileIdentity(volumeUUID: volumeUUID, fileID: fileID)
     }
 }
 

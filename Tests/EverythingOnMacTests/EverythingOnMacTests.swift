@@ -22,6 +22,21 @@ private func makeExecutableScript(contents: String) throws -> String {
     return path
 }
 
+private func insertIndexedEntry(
+    _ db: SQLiteDatabase,
+    volume: String,
+    fileID: Int64,
+    parentID: Int64,
+    name: String,
+    isDirectory: Bool,
+    size: Int64 = 0,
+    modificationDate: Double = 0,
+    uti: Any = NSNull()
+) throws {
+    try db.execute(sql: "INSERT INTO fs_objects (volume_uuid, file_id, is_directory, file_extension, size, modification_date, uti) VALUES (?, ?, ?, ?, ?, ?, ?) ON CONFLICT(volume_uuid, file_id) DO UPDATE SET is_directory=excluded.is_directory, file_extension=excluded.file_extension, size=excluded.size, modification_date=excluded.modification_date, uti=excluded.uti;", bindings: [volume, fileID, isDirectory ? 1 : 0, isDirectory ? "" : URL(fileURLWithPath: name).pathExtension.lowercased(), size, modificationDate, uti])
+    try db.execute(sql: "INSERT OR REPLACE INTO fs_entries (volume_uuid, parent_file_id, target_file_id, name, name_character_mask) VALUES (?, ?, ?, ?, ?);", bindings: [volume, parentID, fileID, name, Int64(bitPattern: FuzzyMatcher.characterMask(for: name))])
+}
+
 @Test("Parser supports filters and flags")
 func parserSupportsStructuredTokens() {
     let query = QueryParser.parse("\"hello world\" ext:md ext:txt path:/Users/me -draft regex:true case:true", mode: .mixed)
@@ -105,11 +120,9 @@ func sqliteDatabaseBasicOperations() throws {
     let db = try SQLiteDatabase(path: dbPath)
     defer { try? FileManager.default.removeItem(atPath: dbPath) }
 
-    // Test tables creation and insertion
-    try db.execute(sql: "INSERT INTO fs_nodes (volume_uuid, file_id, parent_id, name, name_character_mask, is_directory, file_extension, size, modification_date, uti) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?);",
-                   bindings: ["vol-uuid", 12345, 2, "test.txt", Int64(0), 0, "txt", 100, Date().timeIntervalSince1970, "public.text"])
+    try insertIndexedEntry(db, volume: "vol-uuid", fileID: 12345, parentID: 2, name: "test.txt", isDirectory: false, size: 100, modificationDate: Date().timeIntervalSince1970, uti: "public.text")
 
-    let rows = try db.query(sql: "SELECT * FROM fs_nodes WHERE name = ?;", bindings: ["test.txt"])
+    let rows = try db.query(sql: "SELECT * FROM fs_entries WHERE name = ?;", bindings: ["test.txt"])
     #expect(rows.count == 1)
     #expect(rows[0]["volume_uuid"] as? String == "vol-uuid")
 }
@@ -228,67 +241,39 @@ func fileIndexerSortingAndPaging() async throws {
     #expect(offsetResults[0].metadata.filename == "large.txt")
 }
 
-@Test("Database migration is backward compatible and creates parent_name index on v3/v4")
-func databaseMigrationToV3() throws {
-    let dbPath = NSTemporaryDirectory() + UUID().uuidString + "_v3_test.db"
+@Test("Database migration creates hardlink-aware schema and requests rebuild")
+func databaseMigrationToV6() throws {
+    let dbPath = NSTemporaryDirectory() + UUID().uuidString + "_v6_test.db"
     defer { try? FileManager.default.removeItem(atPath: dbPath) }
 
-    // Create the current schema, then explicitly remove the v3-only index and mark it as v2.
     let db = try SQLiteDatabase(path: dbPath)
-    try db.execute(sql: "DROP INDEX IF EXISTS idx_fs_nodes_parent_name;")
-    try db.execute(sql: "PRAGMA user_version = 2;")
+    let version = try db.query(sql: "PRAGMA user_version;")
+    #expect(version.first?["user_version"] as? Int64 == 6)
 
-    let beforeMigration = try db.query(sql: "SELECT name FROM sqlite_master WHERE type='index' AND name='idx_fs_nodes_parent_name';")
-    #expect(beforeMigration.isEmpty)
-
-    // Re-initialize to trigger migration.
-    let db2 = try SQLiteDatabase(path: dbPath)
-
-    // Verify that user_version is now 4 (all the way to latest)
-    let rows = try db2.query(sql: "PRAGMA user_version;")
-    #expect(rows.first?["user_version"] as? Int64 == 5)
-
-    // Verify index exists
-    let indexRows = try db2.query(sql: "SELECT name FROM sqlite_master WHERE type='index' AND name='idx_fs_nodes_parent_name';")
-    #expect(indexRows.count == 1)
+    let tables = try db.query(sql: "SELECT name FROM sqlite_master WHERE type='table' AND name IN ('fs_objects', 'fs_entries');")
+    #expect(tables.count == 2)
+    let legacy = try db.query(sql: "SELECT name FROM sqlite_master WHERE type='table' AND name='fs_nodes';")
+    #expect(legacy.isEmpty)
+    let rebuild = try db.query(sql: "SELECT value FROM metadata WHERE key='rebuild_required';")
+    #expect(rebuild.first?["value"] as? String == "1")
 }
 
-@Test("Database migration is backward compatible and migrates to v4 with character masks")
-func databaseMigrationToV4() throws {
-    let dbPath = NSTemporaryDirectory() + UUID().uuidString + "_v4_test.db"
+@Test("Hardlink schema enforces object-entry identity and foreign keys")
+func hardlinkSchemaConstraints() throws {
+    let dbPath = NSTemporaryDirectory() + UUID().uuidString + "_constraints.db"
     defer { try? FileManager.default.removeItem(atPath: dbPath) }
-
-    // Create schema, drop mask column, set to v3
     let db = try SQLiteDatabase(path: dbPath)
-    try db.execute(sql: "ALTER TABLE fs_nodes DROP COLUMN name_character_mask;")
-    try db.execute(sql: "PRAGMA user_version = 3;")
 
-    // Insert a legacy row using old v3 schema
-    try db.execute(sql: "INSERT INTO fs_nodes (volume_uuid, file_id, parent_id, name, is_directory, file_extension, size, modification_date, uti) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?);",
-                   bindings: ["vol-1", 100, 2, "ApplicationCache", 0, "cache", 0, 0.0, NSNull()])
+    try insertIndexedEntry(db, volume: "vol-1", fileID: 100, parentID: 2, name: "original.txt", isDirectory: false)
+    try insertIndexedEntry(db, volume: "vol-1", fileID: 100, parentID: 3, name: "linked.txt", isDirectory: false)
+    let objects = try db.query(sql: "SELECT * FROM fs_objects WHERE volume_uuid='vol-1' AND file_id=100;")
+    let entries = try db.query(sql: "SELECT * FROM fs_entries WHERE volume_uuid='vol-1' AND target_file_id=100;")
+    #expect(objects.count == 1)
+    #expect(entries.count == 2)
 
-    // Verify column does not exist
-    let colsBefore = try db.query(sql: "PRAGMA table_info(fs_nodes);")
-    let hasColBefore = colsBefore.contains { ($0["name"] as? String) == "name_character_mask" }
-    #expect(!hasColBefore)
-
-    // Re-initialize to trigger migration to v4
-    let db2 = try SQLiteDatabase(path: dbPath)
-
-    // Verify user_version is now 4
-    let rows = try db2.query(sql: "PRAGMA user_version;")
-    #expect(rows.first?["user_version"] as? Int64 == 5)
-
-    // Verify column exists
-    let colsAfter = try db2.query(sql: "PRAGMA table_info(fs_nodes);")
-    let hasColAfter = colsAfter.contains { ($0["name"] as? String) == "name_character_mask" }
-    #expect(hasColAfter)
-
-    // Verify legacy row was successfully backfilled with character mask
-    let updatedRows = try db2.query(sql: "SELECT name_character_mask FROM fs_nodes WHERE file_id = 100;")
-    let maskVal = updatedRows.first?["name_character_mask"] as? Int64 ?? 0
-    let expectedMask = Int64(bitPattern: FuzzyMatcher.characterMask(for: "ApplicationCache"))
-    #expect(maskVal == expectedMask)
+    #expect(throws: (any Error).self) {
+        try db.execute(sql: "INSERT INTO fs_entries (volume_uuid, parent_file_id, target_file_id, name) VALUES ('vol-1', 2, 999, 'orphan.txt');")
+    }
 }
 
 @Test("FileIndexer pathPrefix CTE filtering restricts search space before LIMIT")
@@ -374,23 +359,14 @@ func fileIndexerResolvePathInvalidStructures() async throws {
 
     let db = try SQLiteDatabase(path: dbPath)
 
-    // We create structural nodes directly in DB.
-    // 1. Missing parent node: parent_id = 9999 (corrupt)
-    try db.execute(sql: "INSERT INTO fs_nodes (volume_uuid, file_id, parent_id, name, is_directory, file_extension, size, modification_date) VALUES (?, ?, ?, ?, ?, ?, ?, ?);",
-                   bindings: ["vol-1", 100, 9999, "missing_parent.txt", 0, "txt", 10, Date().timeIntervalSince1970])
+    // We create structural objects and entries directly in DB.
+    try insertIndexedEntry(db, volume: "vol-1", fileID: 100, parentID: 9999, name: "missing_parent.txt", isDirectory: false, size: 10, modificationDate: Date().timeIntervalSince1970)
+    try insertIndexedEntry(db, volume: "vol-1", fileID: 200, parentID: 201, name: "dirA", isDirectory: true, modificationDate: Date().timeIntervalSince1970)
+    try insertIndexedEntry(db, volume: "vol-1", fileID: 201, parentID: 200, name: "dirB", isDirectory: true, modificationDate: Date().timeIntervalSince1970)
+    try insertIndexedEntry(db, volume: "vol-1", fileID: 202, parentID: 200, name: "cycle.txt", isDirectory: false, size: 10, modificationDate: Date().timeIntervalSince1970)
 
-    // 2. Cycle parent node: file_id = 200 (parent = 201), file_id = 201 (parent = 200) (corrupt)
-    try db.execute(sql: "INSERT INTO fs_nodes (volume_uuid, file_id, parent_id, name, is_directory, file_extension, size, modification_date) VALUES (?, ?, ?, ?, ?, ?, ?, ?);",
-                   bindings: ["vol-1", 200, 201, "dirA", 1, "", 0, Date().timeIntervalSince1970])
-    try db.execute(sql: "INSERT INTO fs_nodes (volume_uuid, file_id, parent_id, name, is_directory, file_extension, size, modification_date) VALUES (?, ?, ?, ?, ?, ?, ?, ?);",
-                   bindings: ["vol-1", 201, 200, "dirB", 1, "", 0, Date().timeIntervalSince1970])
-    try db.execute(sql: "INSERT INTO fs_nodes (volume_uuid, file_id, parent_id, name, is_directory, file_extension, size, modification_date) VALUES (?, ?, ?, ?, ?, ?, ?, ?);",
-                   bindings: ["vol-1", 202, 200, "cycle.txt", 0, "txt", 10, Date().timeIntervalSince1970])
-
-    // 3. 5 valid nodes
     for i in 1...5 {
-        try db.execute(sql: "INSERT INTO fs_nodes (volume_uuid, file_id, parent_id, name, is_directory, file_extension, size, modification_date) VALUES (?, ?, ?, ?, ?, ?, ?, ?);",
-                       bindings: ["vol-1", 300 + i, 2, "valid_\(i).txt", 0, "txt", 10, Date().timeIntervalSince1970])
+        try insertIndexedEntry(db, volume: "vol-1", fileID: Int64(300 + i), parentID: 2, name: "valid_\(i).txt", isDirectory: false, size: 10, modificationDate: Date().timeIntervalSince1970)
     }
 
     let config = IndexerConfiguration(roots: [URL(fileURLWithPath: "/tmp")], databasePath: dbPath)
@@ -796,6 +772,56 @@ func searchCoordinatorCapsContentMatches() async throws {
     #expect(merged[0].totalContentMatchCount == 15)
 }
 
+@Test("Hardlinks keep distinct searchable entries and delete independently")
+func hardlinkIndexingAndRemoval() async throws {
+    let root = NSTemporaryDirectory() + UUID().uuidString + "/"
+    let dirA = root + "A/"
+    let dirB = root + "B/"
+    try FileManager.default.createDirectory(atPath: dirA, withIntermediateDirectories: true)
+    try FileManager.default.createDirectory(atPath: dirB, withIntermediateDirectories: true)
+    defer { try? FileManager.default.removeItem(atPath: root) }
+
+    let original = dirA + "report.txt"
+    let linked = dirB + "report-copy.txt"
+    try "shared content".write(toFile: original, atomically: true, encoding: .utf8)
+    try FileManager.default.linkItem(atPath: original, toPath: linked)
+
+    let dbPath = root + "hardlinks.db"
+    let indexer = try FileIndexer(configuration: IndexerConfiguration(
+        roots: [URL(fileURLWithPath: root)],
+        databasePath: dbPath,
+        useFastVolumeScan: false
+    ))
+    try await indexer.upsert(path: dirA)
+    try await indexer.upsert(path: dirB)
+    try await indexer.upsert(path: original)
+    try await indexer.upsert(path: linked)
+
+    let all = (try await indexer.query(QueryParser.parse(""))).results
+        .filter { $0.metadata.filename.hasPrefix("report") }
+    #expect(all.count == 2)
+    #expect(Set(all.compactMap(\.metadata.fileID)).count == 1)
+    #expect(Set(all.compactMap(\.metadata.entryID)).count == 2)
+    #expect((try await indexer.query(QueryParser.parse("report-copy"))).results.map(\.metadata.path).contains(canonicalPath(for: linked)))
+
+    let db = try SQLiteDatabase(path: dbPath)
+    let objectCount = try db.query(sql: "SELECT COUNT(*) AS count FROM fs_objects WHERE file_id = ?;", bindings: [Int64(bitPattern: all[0].metadata.fileID!)])
+    let entryCount = try db.query(sql: "SELECT COUNT(*) AS count FROM fs_entries WHERE target_file_id = ?;", bindings: [Int64(bitPattern: all[0].metadata.fileID!)])
+    #expect(objectCount.first?["count"] as? Int64 == 1)
+    #expect(entryCount.first?["count"] as? Int64 == 2)
+
+    try FileManager.default.removeItem(atPath: original)
+    try await indexer.remove(path: original)
+    #expect((try await indexer.query(QueryParser.parse("report-copy"))).results.count == 1)
+    let remainingEntries = try db.query(sql: "SELECT COUNT(*) AS count FROM fs_entries WHERE target_file_id = ?;", bindings: [Int64(bitPattern: all[0].metadata.fileID!)])
+    #expect(remainingEntries.first?["count"] as? Int64 == 1)
+
+    try FileManager.default.removeItem(atPath: linked)
+    try await indexer.remove(path: linked)
+    let remainingObjects = try db.query(sql: "SELECT COUNT(*) AS count FROM fs_objects WHERE file_id = ?;", bindings: [Int64(bitPattern: all[0].metadata.fileID!)])
+    #expect(remainingObjects.first?["count"] as? Int64 == 0)
+}
+
 @Test("Benchmark fuzzy query with bitmask pre-filtering on 10000 synthetic rows")
 func benchmarkFuzzyBitmaskQuery() async throws {
     let dbPath = NSTemporaryDirectory() + UUID().uuidString + "_bench.db"
@@ -836,8 +862,10 @@ func benchmarkFuzzyBitmaskQuery() async throws {
         ])
     }
 
-    let sql = "INSERT INTO fs_nodes (volume_uuid, file_id, parent_id, name, name_character_mask, is_directory, file_extension, size, modification_date, uti) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?);"
-    try db.executeBatch(sql: sql, items: items)
+    let objectItems = items.map { row in [row[0], row[1], row[5], row[6], row[7], row[8], row[9]] }
+    let entryItems = items.map { row in [row[0], row[2], row[1], row[3], row[4]] }
+    try db.executeBatch(sql: "INSERT INTO fs_objects (volume_uuid, file_id, is_directory, file_extension, size, modification_date, uti) VALUES (?, ?, ?, ?, ?, ?, ?);", items: objectItems)
+    try db.executeBatch(sql: "INSERT INTO fs_entries (volume_uuid, parent_file_id, target_file_id, name, name_character_mask) VALUES (?, ?, ?, ?, ?);", items: entryItems)
 
     let activeIndexer = try FileIndexer(configuration: config)
 

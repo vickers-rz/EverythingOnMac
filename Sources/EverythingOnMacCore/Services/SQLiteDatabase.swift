@@ -122,6 +122,59 @@ public final class SQLiteDatabase: @unchecked Sendable {
             try execute(sql: "PRAGMA user_version = 5;")
             currentVersion = 5
         }
+
+        if currentVersion < 6 {
+            // fs_nodes cannot represent multiple directory entries for one hardlinked object.
+            // Old data is intentionally discarded because overwritten hardlink paths cannot be recovered.
+            try execute(sql: "BEGIN IMMEDIATE;")
+            do {
+                try execute(sql: "PRAGMA foreign_keys = ON;")
+                try execute(sql: """
+                    CREATE TABLE IF NOT EXISTS fs_objects (
+                        volume_uuid TEXT NOT NULL,
+                        file_id INTEGER NOT NULL,
+                        is_directory INTEGER NOT NULL,
+                        file_extension TEXT NOT NULL DEFAULT '',
+                        size INTEGER NOT NULL DEFAULT 0,
+                        modification_date REAL,
+                        uti TEXT,
+                        link_count INTEGER,
+                        content_fingerprint TEXT,
+                        PRIMARY KEY (volume_uuid, file_id)
+                    );
+                    """)
+                try execute(sql: """
+                    CREATE TABLE IF NOT EXISTS fs_entries (
+                        entry_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        volume_uuid TEXT NOT NULL,
+                        parent_file_id INTEGER NOT NULL,
+                        target_file_id INTEGER NOT NULL,
+                        name TEXT NOT NULL,
+                        name_character_mask INTEGER NOT NULL DEFAULT 0,
+                        UNIQUE (volume_uuid, parent_file_id, name),
+                        FOREIGN KEY (volume_uuid, target_file_id)
+                            REFERENCES fs_objects(volume_uuid, file_id)
+                            ON DELETE CASCADE
+                    );
+                    """)
+                try execute(sql: "CREATE INDEX IF NOT EXISTS idx_fs_entries_target ON fs_entries(volume_uuid, target_file_id);")
+                try execute(sql: "CREATE INDEX IF NOT EXISTS idx_fs_entries_parent ON fs_entries(volume_uuid, parent_file_id);")
+                try execute(sql: "CREATE INDEX IF NOT EXISTS idx_fs_entries_name ON fs_entries(name);")
+                try execute(sql: "CREATE INDEX IF NOT EXISTS idx_fs_entries_mask ON fs_entries(name_character_mask);")
+                try execute(sql: "CREATE INDEX IF NOT EXISTS idx_fs_objects_extension ON fs_objects(file_extension);")
+                try execute(sql: "DROP TABLE IF EXISTS fs_nodes;")
+                try execute(sql: "DELETE FROM metadata WHERE key = 'last_event_id';")
+                try execute(sql: "INSERT OR REPLACE INTO metadata(key, value) VALUES ('rebuild_required', '1');")
+                try execute(sql: "PRAGMA user_version = 6;")
+                try execute(sql: "COMMIT;")
+                currentVersion = 6
+            } catch {
+                try? execute(sql: "ROLLBACK;")
+                throw error
+            }
+        }
+
+        try execute(sql: "PRAGMA foreign_keys = ON;")
     }
 
     private func registerCustomFunctions() {
