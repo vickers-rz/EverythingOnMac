@@ -2,6 +2,26 @@ import Foundation
 import Testing
 @testable import EverythingOnMacCore
 
+private func canonicalPath(for path: String) -> String {
+    var buffer = [Int8](repeating: 0, count: Int(PATH_MAX))
+    guard realpath(path, &buffer) != nil else {
+        return path
+    }
+    return buffer.withUnsafeBufferPointer { ptr in
+        String(cString: ptr.baseAddress!)
+    }
+}
+
+private func makeExecutableScript(contents: String) throws -> String {
+    let path = NSTemporaryDirectory() + UUID().uuidString + ".sh"
+    try contents.write(toFile: path, atomically: true, encoding: .utf8)
+    try FileManager.default.setAttributes(
+        [.posixPermissions: NSNumber(value: Int16(0o755))],
+        ofItemAtPath: path
+    )
+    return path
+}
+
 @Test("Parser supports filters and flags")
 func parserSupportsStructuredTokens() {
     let query = QueryParser.parse("\"hello world\" ext:md ext:txt path:/Users/me -draft regex:true case:true", mode: .mixed)
@@ -30,12 +50,12 @@ func mergeCombinesIndexAndContent() {
     let fromContent = SearchResult(metadata: metadata, source: [.contentRipgrep], contentMatches: [ContentMatch(line: 5, column: 1, text: "abc")])
 
     let coordinator = SearchCoordinator(
-        indexer: FileIndexer(configuration: IndexerConfiguration(roots: [])),
+        indexer: try! FileIndexer(configuration: IndexerConfiguration(roots: [])),
         ripgrepSearcher: RipgrepSearcher(),
         roots: []
     )
 
-    let merged = coordinator.merge(index: [fromIndex], content: [fromContent])
+    let merged = coordinator.merge(index: [fromIndex], content: [fromContent], query: QueryParser.parse(""))
 
     #expect(merged.count == 1)
     #expect(merged[0].source.contains(.filenameIndex))
@@ -56,4 +76,763 @@ func volumeInspectorReportsRoots() {
     let capabilities = APFSVolumeInspector.inspect(roots: roots)
     #expect(capabilities.count == 1)
     #expect(capabilities[0].rootPath == roots[0].path)
+}
+
+@Test("SQLite database basic operations and querying")
+func sqliteDatabaseBasicOperations() throws {
+    let dbPath = NSTemporaryDirectory() + UUID().uuidString + "_test.db"
+    let db = try SQLiteDatabase(path: dbPath)
+    defer { try? FileManager.default.removeItem(atPath: dbPath) }
+
+    // Test tables creation and insertion
+    try db.execute(sql: "INSERT INTO fs_nodes (volume_uuid, file_id, parent_id, name, name_character_mask, is_directory, file_extension, size, modification_date, uti) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?);",
+                   bindings: ["vol-uuid", 12345, 2, "test.txt", Int64(0), 0, "txt", 100, Date().timeIntervalSince1970, "public.text"])
+
+    let rows = try db.query(sql: "SELECT * FROM fs_nodes WHERE name = ?;", bindings: ["test.txt"])
+    #expect(rows.count == 1)
+    #expect(rows[0]["volume_uuid"] as? String == "vol-uuid")
+}
+
+@Test("FileIndexer SQLite integration and search features")
+func fileIndexerSearchFeatures() async throws {
+    let rawTempDir = NSTemporaryDirectory() + UUID().uuidString + "/"
+    try FileManager.default.createDirectory(atPath: rawTempDir, withIntermediateDirectories: true)
+    let tempDir = canonicalPath(for: rawTempDir) + "/"
+    defer { try? FileManager.default.removeItem(atPath: tempDir) }
+
+    let file1 = tempDir + "Report.pdf"
+    let file2 = tempDir + "notes.txt"
+    let file3 = tempDir + "vacation.jpg"
+
+    try "pdf".write(toFile: file1, atomically: true, encoding: .utf8)
+    try "text".write(toFile: file2, atomically: true, encoding: .utf8)
+    try "jpg".write(toFile: file3, atomically: true, encoding: .utf8)
+
+    let dbPath = tempDir + "indexer.db"
+    let config = IndexerConfiguration(roots: [URL(fileURLWithPath: tempDir)], databasePath: dbPath)
+    let indexer = try FileIndexer(configuration: config)
+
+    // Manually add some test files to indexer DB via upsert
+    await indexer.upsert(path: file1)
+    await indexer.upsert(path: file2)
+    await indexer.upsert(path: file3)
+
+    // Test basic query
+    let query1 = QueryParser.parse("report")
+    let results1 = try await indexer.query(query1)
+    #expect(results1.count == 1)
+    #expect(results1[0].metadata.filename == "Report.pdf")
+
+    // Test ext filter
+    let query2 = QueryParser.parse("ext:txt")
+    let results2 = try await indexer.query(query2)
+    #expect(results2.count == 1)
+    #expect(results2[0].metadata.filename == "notes.txt")
+
+    // Test path prefix filter
+    let query3 = QueryParser.parse("path:\(tempDir)")
+    let results3 = try await indexer.query(query3)
+    #expect(results3.count == 3)
+
+    // Test regex query
+    let query4 = QueryParser.parse("vacation regex:true")
+    let results4 = try await indexer.query(query4)
+    #expect(results4.count == 1)
+    #expect(results4[0].metadata.filename == "vacation.jpg")
+    
+    // Test regex case-sensitive query
+    let query5 = QueryParser.parse("^notes.*txt$ regex:true")
+    let results5 = try await indexer.query(query5)
+    #expect(results5.count == 1)
+}
+
+@Test("QueryParser parses size and dates")
+func queryParserParsesSizeAndDates() {
+    let query = QueryParser.parse("size:>10M date:<2026-07-01 uti:public.image")
+    #expect(query.minSize == Int64(10 * 1024 * 1024))
+    #expect(query.minSizeOp == ">")
+    #expect(query.maxDate != nil)
+    #expect(query.maxDateOp == "<")
+    #expect(query.utiFilter == "public.image")
+}
+
+@Test("FileIndexer SQLite sorting and paging")
+func fileIndexerSortingAndPaging() async throws {
+    let rawTempDir = NSTemporaryDirectory() + UUID().uuidString + "/"
+    try FileManager.default.createDirectory(atPath: rawTempDir, withIntermediateDirectories: true)
+    let tempDir = canonicalPath(for: rawTempDir) + "/"
+    defer { try? FileManager.default.removeItem(atPath: tempDir) }
+
+    let file1 = tempDir + "small.txt"
+    let file2 = tempDir + "large.txt"
+
+    // small file: 10 bytes
+    try "0123456789".write(toFile: file1, atomically: true, encoding: .utf8)
+    // large file: 20 bytes
+    try "01234567890123456789".write(toFile: file2, atomically: true, encoding: .utf8)
+
+    let dbPath = tempDir + "sort_test.db"
+    let config = IndexerConfiguration(roots: [URL(fileURLWithPath: tempDir)], databasePath: dbPath)
+    let indexer = try FileIndexer(configuration: config)
+
+    await indexer.upsert(path: file1)
+    await indexer.upsert(path: file2)
+
+    // Test sort by size ascending
+    var query = QueryParser.parse("ext:txt")
+    query.sortOption = SortOption(field: .size, direction: .ascending)
+    let ascResults = try await indexer.query(query)
+    #expect(ascResults.count == 2)
+    #expect(ascResults[0].metadata.filename == "small.txt")
+    #expect(ascResults[1].metadata.filename == "large.txt")
+
+    // Test sort by size descending
+    query.sortOption = SortOption(field: .size, direction: .descending)
+    let descResults = try await indexer.query(query)
+    #expect(descResults.count == 2)
+    #expect(descResults[0].metadata.filename == "large.txt")
+    #expect(descResults[1].metadata.filename == "small.txt")
+
+    // Test paging (limit = 1)
+    query.limit = 1
+    query.sortOption = SortOption(field: .size, direction: .ascending)
+    let limitResults = try await indexer.query(query)
+    #expect(limitResults.count == 1)
+    #expect(limitResults[0].metadata.filename == "small.txt")
+
+    // Test paging with offset (limit = 1, offset = 1)
+    query.offset = 1
+    let offsetResults = try await indexer.query(query)
+    #expect(offsetResults.count == 1)
+    #expect(offsetResults[0].metadata.filename == "large.txt")
+}
+
+@Test("Database migration is backward compatible and creates parent_name index on v3/v4")
+func databaseMigrationToV3() throws {
+    let dbPath = NSTemporaryDirectory() + UUID().uuidString + "_v3_test.db"
+    defer { try? FileManager.default.removeItem(atPath: dbPath) }
+
+    // Create the current schema, then explicitly remove the v3-only index and mark it as v2.
+    let db = try SQLiteDatabase(path: dbPath)
+    try db.execute(sql: "DROP INDEX IF EXISTS idx_fs_nodes_parent_name;")
+    try db.execute(sql: "PRAGMA user_version = 2;")
+
+    let beforeMigration = try db.query(sql: "SELECT name FROM sqlite_master WHERE type='index' AND name='idx_fs_nodes_parent_name';")
+    #expect(beforeMigration.isEmpty)
+
+    // Re-initialize to trigger migration.
+    let db2 = try SQLiteDatabase(path: dbPath)
+
+    // Verify that user_version is now 4 (all the way to latest)
+    let rows = try db2.query(sql: "PRAGMA user_version;")
+    #expect(rows.first?["user_version"] as? Int64 == 5)
+
+    // Verify index exists
+    let indexRows = try db2.query(sql: "SELECT name FROM sqlite_master WHERE type='index' AND name='idx_fs_nodes_parent_name';")
+    #expect(indexRows.count == 1)
+}
+
+@Test("Database migration is backward compatible and migrates to v4 with character masks")
+func databaseMigrationToV4() throws {
+    let dbPath = NSTemporaryDirectory() + UUID().uuidString + "_v4_test.db"
+    defer { try? FileManager.default.removeItem(atPath: dbPath) }
+
+    // Create schema, drop mask column, set to v3
+    let db = try SQLiteDatabase(path: dbPath)
+    try db.execute(sql: "ALTER TABLE fs_nodes DROP COLUMN name_character_mask;")
+    try db.execute(sql: "PRAGMA user_version = 3;")
+
+    // Insert a legacy row using old v3 schema
+    try db.execute(sql: "INSERT INTO fs_nodes (volume_uuid, file_id, parent_id, name, is_directory, file_extension, size, modification_date, uti) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?);",
+                   bindings: ["vol-1", 100, 2, "ApplicationCache", 0, "cache", 0, 0.0, NSNull()])
+
+    // Verify column does not exist
+    let colsBefore = try db.query(sql: "PRAGMA table_info(fs_nodes);")
+    let hasColBefore = colsBefore.contains { ($0["name"] as? String) == "name_character_mask" }
+    #expect(!hasColBefore)
+
+    // Re-initialize to trigger migration to v4
+    let db2 = try SQLiteDatabase(path: dbPath)
+
+    // Verify user_version is now 4
+    let rows = try db2.query(sql: "PRAGMA user_version;")
+    #expect(rows.first?["user_version"] as? Int64 == 5)
+
+    // Verify column exists
+    let colsAfter = try db2.query(sql: "PRAGMA table_info(fs_nodes);")
+    let hasColAfter = colsAfter.contains { ($0["name"] as? String) == "name_character_mask" }
+    #expect(hasColAfter)
+
+    // Verify legacy row was successfully backfilled with character mask
+    let updatedRows = try db2.query(sql: "SELECT name_character_mask FROM fs_nodes WHERE file_id = 100;")
+    let maskVal = updatedRows.first?["name_character_mask"] as? Int64 ?? 0
+    let expectedMask = Int64(bitPattern: FuzzyMatcher.characterMask(for: "ApplicationCache"))
+    #expect(maskVal == expectedMask)
+}
+
+@Test("FileIndexer pathPrefix CTE filtering restricts search space before LIMIT")
+func pathPrefixCTEFilteringRestrictsBeforeLimit() async throws {
+    let rawTempDir = NSTemporaryDirectory() + UUID().uuidString + "/"
+    try FileManager.default.createDirectory(atPath: rawTempDir, withIntermediateDirectories: true)
+    let tempDir = canonicalPath(for: rawTempDir) + "/"
+    defer { try? FileManager.default.removeItem(atPath: tempDir) }
+
+    // Create nested subdirectories
+    let subDir = tempDir + "matching_sub/"
+    try FileManager.default.createDirectory(atPath: subDir, withIntermediateDirectories: true)
+
+    // Create matching files outside the requested subtree. Without SQL-level
+    // path filtering, filename ordering plus LIMIT would select one of these.
+    for i in 1...5 {
+        try "data".write(toFile: tempDir + String(format: "match_%02d.txt", i), atomically: true, encoding: .utf8)
+    }
+
+    // Create one matching file inside the requested subtree.
+    try "data".write(toFile: subDir + "match_target.txt", atomically: true, encoding: .utf8)
+
+    let dbPath = tempDir + "cte_test.db"
+    let config = IndexerConfiguration(roots: [URL(fileURLWithPath: tempDir)], databasePath: dbPath)
+    let indexer = try FileIndexer(configuration: config)
+
+    // Upsert all files.
+    for i in 1...5 {
+        await indexer.upsert(path: tempDir + String(format: "match_%02d.txt", i))
+    }
+    await indexer.upsert(path: subDir)
+    await indexer.upsert(path: subDir + "match_target.txt")
+
+    // Query with pathPrefix = subDir and LIMIT = 1. All files match the term,
+    // so the CTE must restrict the candidate set before LIMIT is applied.
+    var query = QueryParser.parse("match path:\(subDir)")
+    query.limit = 1
+    query.sortOption = SortOption(field: .filename, direction: .ascending)
+
+    let results = try await indexer.query(query)
+    #expect(results.count == 1)
+    #expect(results[0].metadata.filename == "match_target.txt")
+}
+
+@Test("FileIndexer rebuild prunes excluded paths")
+func rebuildPrunesExcludedPaths() async throws {
+    let rawTempDir = NSTemporaryDirectory() + UUID().uuidString + "/"
+    try FileManager.default.createDirectory(atPath: rawTempDir, withIntermediateDirectories: true)
+    let tempDir = canonicalPath(for: rawTempDir) + "/"
+    defer { try? FileManager.default.removeItem(atPath: tempDir) }
+
+    let excludedDir = tempDir + "ExcludedDir/"
+    try FileManager.default.createDirectory(atPath: excludedDir, withIntermediateDirectories: true)
+
+    try "ok".write(toFile: tempDir + "keep.txt", atomically: true, encoding: .utf8)
+    try "noop".write(toFile: excludedDir + "skip.txt", atomically: true, encoding: .utf8)
+
+    let dbPath = tempDir + "pruning_test.db"
+    let config = IndexerConfiguration(
+        roots: [URL(fileURLWithPath: tempDir)],
+        excludedPaths: [excludedDir],
+        databasePath: dbPath,
+        useFastVolumeScan: false
+    )
+    let indexer = try FileIndexer(configuration: config)
+
+    // Trigger rebuilding (which scans the volume/root and prunes)
+    await indexer.rebuild()
+
+    // Query all results
+    let results = try await indexer.query(QueryParser.parse(""))
+
+    // keep.txt should exist, skip.txt should be pruned
+    let filenames = results.map { $0.metadata.filename }
+    #expect(filenames.contains("keep.txt"))
+    #expect(!filenames.contains("skip.txt"))
+}
+
+@Test("Unresolvable pathPrefix throws invalidPathPrefix error")
+func unresolvablePathPrefixReturnsEmpty() async throws {
+    let rawTempDir = NSTemporaryDirectory() + UUID().uuidString + "/"
+    try FileManager.default.createDirectory(atPath: rawTempDir, withIntermediateDirectories: true)
+    let tempDir = canonicalPath(for: rawTempDir) + "/"
+    defer { try? FileManager.default.removeItem(atPath: tempDir) }
+
+    let filePath = tempDir + "visible.txt"
+    try "data".write(toFile: filePath, atomically: true, encoding: .utf8)
+
+    let indexer = try FileIndexer(configuration: IndexerConfiguration(
+        roots: [URL(fileURLWithPath: tempDir)],
+        databasePath: tempDir + "invalid_prefix.db"
+    ))
+    await indexer.upsert(path: filePath)
+
+    let missingPath = tempDir + "does-not-exist/"
+    let query = QueryParser.parse("visible path:\(missingPath)")
+    await #expect(throws: FileIndexSearchError.self) {
+        _ = try await indexer.query(query)
+    }
+}
+
+@Test("Ripgrep reports an unavailable executable")
+func ripgrepReportsUnavailableExecutable() async {
+    let missingPath = NSTemporaryDirectory() + UUID().uuidString + "/rg"
+    let searcher = RipgrepSearcher(configuration: RipgrepConfiguration(executablePath: missingPath))
+
+    do {
+        _ = try await searcher.search(query: QueryParser.parse("needle", mode: .contentOnly), roots: [URL(fileURLWithPath: NSTemporaryDirectory())])
+        Issue.record("Expected executableUnavailable")
+    } catch let error as RipgrepSearchError {
+        #expect(error == .executableUnavailable(missingPath))
+    } catch {
+        Issue.record("Unexpected error: \(error)")
+    }
+}
+
+@Test("Ripgrep preserves bounded stderr and exit status")
+func ripgrepPreservesBoundedStderr() async throws {
+    let script = try makeExecutableScript(contents: """
+    #!/bin/sh
+    printf 'prefix-0123456789-error-detail' >&2
+    exit 2
+    """)
+    defer { try? FileManager.default.removeItem(atPath: script) }
+
+    let searcher = RipgrepSearcher(configuration: RipgrepConfiguration(
+        executablePath: script,
+        timeoutSeconds: 6,
+        maximumStderrBytes: 12
+    ))
+
+    do {
+        _ = try await searcher.search(query: QueryParser.parse("needle", mode: .contentOnly), roots: [URL(fileURLWithPath: NSTemporaryDirectory())])
+        Issue.record("Expected failed exit status")
+    } catch let error as RipgrepSearchError {
+        guard case .failed(let exitCode, let stderr) = error else {
+            Issue.record("Unexpected ripgrep error: \(error)")
+            return
+        }
+        #expect(exitCode == 2)
+        #expect(stderr == "error-detail")
+    }
+}
+
+@Test("Ripgrep times out and terminates the child process")
+func ripgrepTimesOut() async throws {
+    let script = try makeExecutableScript(contents: """
+    #!/bin/sh
+    sleep 2
+    exit 0
+    """)
+    defer { try? FileManager.default.removeItem(atPath: script) }
+
+    let searcher = RipgrepSearcher(configuration: RipgrepConfiguration(
+        executablePath: script,
+        timeoutSeconds: 0.05
+    ))
+
+    do {
+        _ = try await searcher.search(query: QueryParser.parse("needle", mode: .contentOnly), roots: [URL(fileURLWithPath: NSTemporaryDirectory())])
+        Issue.record("Expected timeout")
+    } catch let error as RipgrepSearchError {
+        guard case .timedOut(let seconds) = error else {
+            Issue.record("Unexpected ripgrep error: \(error)")
+            return
+        }
+        #expect(seconds == 0.05)
+    }
+}
+
+@Test("Ripgrep streams the first match before the process finishes")
+func ripgrepStreamsIncrementally() async throws {
+    let markerPath = NSTemporaryDirectory() + UUID().uuidString + ".done"
+    let script = try makeExecutableScript(contents: """
+    #!/bin/sh
+    printf '%s\\n' '{"type":"match","data":{"path":{"text":"/tmp/first.txt"},"lines":{"text":"first\\n"},"line_number":1,"submatches":[{"start":0}]}}'
+    sleep 1
+    touch '\(markerPath)'
+    printf '%s\\n' '{"type":"match","data":{"path":{"text":"/tmp/second.txt"},"lines":{"text":"second\\n"},"line_number":2,"submatches":[{"start":0}]}}'
+    exit 0
+    """)
+    defer {
+        try? FileManager.default.removeItem(atPath: script)
+        try? FileManager.default.removeItem(atPath: markerPath)
+    }
+
+    let searcher = RipgrepSearcher(configuration: RipgrepConfiguration(
+        executablePath: script,
+        timeoutSeconds: 5
+    ))
+    let stream = await searcher.stream(
+        query: QueryParser.parse("needle", mode: .contentOnly),
+        roots: [URL(fileURLWithPath: NSTemporaryDirectory())]
+    )
+    var iterator = stream.makeAsyncIterator()
+
+    let first = try await iterator.next()
+    #expect(first?.metadata.path == "/tmp/first.txt")
+    #expect(!FileManager.default.fileExists(atPath: markerPath))
+
+    let second = try await iterator.next()
+    #expect(second?.metadata.path == "/tmp/second.txt")
+    #expect(FileManager.default.fileExists(atPath: markerPath))
+    #expect(try await iterator.next() == nil)
+}
+
+@Test("SearchCoordinator batches streaming updates while preserving the first result")
+func searchCoordinatorBatchesStreamingUpdates() async throws {
+    let rawTempDir = NSTemporaryDirectory() + UUID().uuidString + "/"
+    try FileManager.default.createDirectory(atPath: rawTempDir, withIntermediateDirectories: true)
+    let tempDir = canonicalPath(for: rawTempDir) + "/"
+    defer { try? FileManager.default.removeItem(atPath: tempDir) }
+
+    let jsonLines = (1...10).map { index in
+        "{\"type\":\"match\",\"data\":{\"path\":{\"text\":\"/tmp/item_\(index).txt\"},\"lines\":{\"text\":\"match \(index)\\\\n\"},\"line_number\":\(index),\"submatches\":[{\"start\":0}]}}"
+    }.joined(separator: "\n")
+    let script = try makeExecutableScript(contents: """
+    #!/bin/sh
+    cat <<'JSON'
+    \(jsonLines)
+    JSON
+    """)
+    defer { try? FileManager.default.removeItem(atPath: script) }
+
+    let indexer = try FileIndexer(configuration: IndexerConfiguration(
+        roots: [URL(fileURLWithPath: tempDir)],
+        databasePath: tempDir + "stream_batch.db"
+    ))
+    let searcher = RipgrepSearcher(configuration: RipgrepConfiguration(
+        executablePath: script,
+        timeoutSeconds: 5
+    ))
+    let coordinator = SearchCoordinator(
+        indexer: indexer,
+        ripgrepSearcher: searcher,
+        roots: [URL(fileURLWithPath: tempDir)],
+        streamBatchSize: 4,
+        streamFlushInterval: .seconds(60)
+    )
+
+    let stream = await coordinator.searchStream(
+        query: QueryParser.parse("match", mode: .contentOnly)
+    )
+    var responses: [SearchResponse] = []
+    for await response in stream {
+        responses.append(response)
+    }
+
+    #expect(responses.first?.results.isEmpty == true)
+    #expect(responses.dropFirst().first?.results.count == 1)
+    #expect(responses.last?.results.count == 10)
+    #expect(responses.count == 5)
+}
+
+@Test("SearchCoordinator incrementally merges content into an indexed file")
+func searchCoordinatorIncrementallyMergesIndexedFile() async throws {
+    let rawTempDir = NSTemporaryDirectory() + UUID().uuidString + "/"
+    try FileManager.default.createDirectory(atPath: rawTempDir, withIntermediateDirectories: true)
+    let tempDir = canonicalPath(for: rawTempDir) + "/"
+    defer { try? FileManager.default.removeItem(atPath: tempDir) }
+
+    let filePath = tempDir + "needle-shared.txt"
+    try "needle".write(toFile: filePath, atomically: true, encoding: .utf8)
+    let escapedPath = filePath.replacingOccurrences(of: "\\", with: "\\\\")
+        .replacingOccurrences(of: "\"", with: "\\\"")
+    let script = try makeExecutableScript(contents: """
+    #!/bin/sh
+    cat <<'JSON'
+    {"type":"match","data":{"path":{"text":"\(escapedPath)"},"lines":{"text":"needle\\n"},"line_number":1,"submatches":[{"start":0}]}}
+    JSON
+    """)
+    defer { try? FileManager.default.removeItem(atPath: script) }
+
+    let indexer = try FileIndexer(configuration: IndexerConfiguration(
+        roots: [URL(fileURLWithPath: tempDir)],
+        databasePath: tempDir + "incremental_merge.db"
+    ))
+    await indexer.upsert(path: filePath)
+
+    let coordinator = SearchCoordinator(
+        indexer: indexer,
+        ripgrepSearcher: RipgrepSearcher(configuration: RipgrepConfiguration(
+            executablePath: script,
+            timeoutSeconds: 5
+        )),
+        roots: [URL(fileURLWithPath: tempDir)]
+    )
+
+    let stream = await coordinator.searchStream(query: QueryParser.parse("needle", mode: .mixed))
+    var finalResponse = SearchResponse(results: [], contentError: nil)
+    for await response in stream {
+        finalResponse = response
+    }
+
+    #expect(finalResponse.results.count == 1)
+    #expect(finalResponse.results[0].source.contains(.filenameIndex))
+    #expect(finalResponse.results[0].source.contains(.contentRipgrep))
+    #expect(finalResponse.results[0].contentMatches.count == 1)
+}
+
+@Test("Ripgrep decodes JSON match output")
+func ripgrepDecodesJSONMatchOutput() async throws {
+    let script = try makeExecutableScript(contents: """
+    #!/bin/sh
+    printf '%s\\n' '{"type":"match","data":{"path":{"text":"/tmp/example.txt"},"lines":{"text":"hello needle\\n"},"line_number":7,"submatches":[{"start":6}]}}'
+    exit 0
+    """)
+    defer { try? FileManager.default.removeItem(atPath: script) }
+
+    let searcher = RipgrepSearcher(configuration: RipgrepConfiguration(
+        executablePath: script,
+        timeoutSeconds: 6
+    ))
+    let results = try await searcher.search(
+        query: QueryParser.parse("needle", mode: .contentOnly),
+        roots: [URL(fileURLWithPath: NSTemporaryDirectory())]
+    )
+
+    #expect(results[0].contentMatches.first?.column == 6)
+}
+
+@Test("Character mask supports ASCII letters and digits")
+func characterMaskSupportsASCIIAndDigits() {
+    let mask = FuzzyMatcher.characterMask(for: "abc123")
+    let qMask = FuzzyMatcher.characterMask(for: "abc")
+    let invalidQ = FuzzyMatcher.characterMask(for: "xyz")
+
+    #expect((mask & qMask) == qMask)
+    #expect((mask & invalidQ) != invalidQ)
+}
+
+@Test("Character mask never rejects a valid fuzzy subsequence")
+func characterMaskNeverRejectsFuzzySubsequence() {
+    let text = "ApplicationCache"
+    let query = "apc"
+
+    let textMask = FuzzyMatcher.characterMask(for: text)
+    let queryMask = FuzzyMatcher.characterMask(for: query)
+
+    #expect((textMask & queryMask) == queryMask)
+}
+
+@Test("Repeated query characters are validated by fuzzy scoring")
+func repeatedQueryCharactersValidatedByFuzzyScoring() {
+    let query = FuzzyMatcher.prepare(query: "app", caseSensitive: false)
+    let score = FuzzyMatcher.score(preparedQuery: query, candidate: "ap")
+    #expect(score == nil)
+}
+
+@Test("Unicode candidate survives character-mask prefilter")
+func unicodeCandidateSurvivesMaskPrefilter() {
+    let text = "我的文件_report"
+    let textMask = FuzzyMatcher.characterMask(for: text)
+    let queryMask = FuzzyMatcher.characterMask(for: "文件")
+
+    #expect((textMask & queryMask) == queryMask)
+}
+
+@Test("Fuzzy scoring ranks exact matches, prefix matches, and subsequence compactness")
+func fuzzyScoringRanksCorrectly() {
+    let q = FuzzyMatcher.prepare(query: "report", caseSensitive: false)
+
+    let exact = FuzzyMatcher.score(preparedQuery: q, candidate: "report") ?? 0
+    let prefix = FuzzyMatcher.score(preparedQuery: q, candidate: "report_july.txt") ?? 0
+    let sub = FuzzyMatcher.score(preparedQuery: q, candidate: "july_report.txt") ?? 0
+    let sparse = FuzzyMatcher.score(preparedQuery: q, candidate: "r_e_p_o_r_t_long.txt") ?? 0
+
+    #expect(exact > prefix)
+    #expect(prefix > sub)
+    #expect(sub > sparse)
+}
+
+@Test("SQLite FUZZY_SCORE function tests")
+func sqliteFuzzyScoreFunctionTests() throws {
+    let dbPath = NSTemporaryDirectory() + UUID().uuidString + ".db"
+    defer { try? FileManager.default.removeItem(atPath: dbPath) }
+
+    let db = try SQLiteDatabase(path: dbPath)
+
+    // Test match
+    let rows = try db.query(sql: "SELECT FUZZY_SCORE(?, ?, ?) as score;", bindings: ["apc", "ApplicationCache", false])
+    #expect(rows.first?["score"] is Int64)
+
+    // Test non-match
+    let rowsNoMatch = try db.query(sql: "SELECT FUZZY_SCORE(?, ?, ?) as score;", bindings: ["xyz", "ApplicationCache", false])
+    #expect(rowsNoMatch.first?["score"] is NSNull)
+}
+
+@Test("Relevance scorer correctly ranks hybrid and base scores")
+func relevanceScorerRanksCorrectly() {
+    let query = QueryParser.parse("ApplicationCache")
+
+    let meta = FileMetadata(path: "/a/ApplicationCache", filename: "ApplicationCache", fileExtension: "", size: 100, modificationDate: Date(), fileID: 1, uti: nil)
+
+    let onlyFilename = SearchResult(metadata: meta, source: [.filenameIndex])
+    let onlyContent = SearchResult(metadata: meta, source: [.contentRipgrep], contentMatches: [ContentMatch(line: 5, column: 10, text: "ApplicationCache")])
+    let hybrid = SearchResult(metadata: meta, source: [.filenameIndex, .contentRipgrep], contentMatches: [ContentMatch(line: 5, column: 10, text: "ApplicationCache")])
+
+    let scoreFilename = SearchRelevanceScorer.score(result: onlyFilename, query: query)
+    let scoreContent = SearchRelevanceScorer.score(result: onlyContent, query: query)
+    let scoreHybrid = SearchRelevanceScorer.score(result: hybrid, query: query)
+
+    #expect(scoreHybrid > scoreFilename)
+    #expect(scoreHybrid > scoreContent)
+}
+
+@Test("SearchCoordinator caps content matches at 10 to avoid bloat")
+func searchCoordinatorCapsContentMatches() async throws {
+    let dbPath = NSTemporaryDirectory() + UUID().uuidString + ".db"
+    defer { try? FileManager.default.removeItem(atPath: dbPath) }
+
+    let config = IndexerConfiguration(roots: [URL(fileURLWithPath: NSTemporaryDirectory())], databasePath: dbPath)
+    let indexer = try FileIndexer(configuration: config)
+    let searcher = RipgrepSearcher(configuration: RipgrepConfiguration(executablePath: "rg"))
+
+    let coordinator = SearchCoordinator(
+        indexer: indexer,
+        ripgrepSearcher: searcher,
+        roots: [URL(fileURLWithPath: NSTemporaryDirectory())],
+        policy: SearchExecutionPolicy(maximumContentMatchesPerFile: 10)
+    )
+
+    let meta = FileMetadata(path: "/a/test.txt", filename: "test.txt", fileExtension: "txt", size: 10, modificationDate: Date(), fileID: 10, uti: nil)
+    var items: [SearchResult] = []
+    for i in 1...15 {
+        items.append(SearchResult(metadata: meta, source: [.contentRipgrep], contentMatches: [ContentMatch(line: i, column: 1, text: "match")]))
+    }
+
+    let merged = coordinator.merge(index: [], content: items, query: QueryParser.parse("match"))
+    #expect(merged.count == 1)
+    #expect(merged[0].contentMatches.count == 10)
+    #expect(merged[0].totalContentMatchCount == 15)
+}
+
+@Test("Benchmark fuzzy query with bitmask pre-filtering on 10000 synthetic rows")
+func benchmarkFuzzyBitmaskQuery() async throws {
+    let dbPath = NSTemporaryDirectory() + UUID().uuidString + "_bench.db"
+    defer { try? FileManager.default.removeItem(atPath: dbPath) }
+
+    let config = IndexerConfiguration(roots: [URL(fileURLWithPath: NSTemporaryDirectory())], databasePath: dbPath)
+    let db = try SQLiteDatabase(path: dbPath)
+    var items: [[Any]] = []
+
+    let now = Date().timeIntervalSince1970
+    items.append([
+        "vol-1",
+        Int64(1),
+        Int64(2),
+        "ApplicationCache",
+        Int64(bitPattern: FuzzyMatcher.characterMask(for: "ApplicationCache")),
+        Int64(0),
+        "cache",
+        Int64(1024),
+        now,
+        "public.data"
+    ])
+
+    for i in 2...10000 {
+        let name = "file_\(i)_random_name_\(UUID().uuidString.prefix(8)).txt"
+        let mask = FuzzyMatcher.characterMask(for: name)
+        items.append([
+            "vol-1",
+            Int64(i),
+            Int64(2),
+            name,
+            Int64(bitPattern: mask),
+            Int64(0),
+            "txt",
+            Int64(100),
+            now,
+            "public.text"
+        ])
+    }
+
+    let sql = "INSERT INTO fs_nodes (volume_uuid, file_id, parent_id, name, name_character_mask, is_directory, file_extension, size, modification_date, uti) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?);"
+    try db.executeBatch(sql: sql, items: items)
+
+    let activeIndexer = try FileIndexer(configuration: config)
+
+    let start = DispatchTime.now()
+
+    let query = SearchQuery(raw: "apc", terms: ["apc"], filenameMatchMode: .fuzzy, limit: 100)
+    let results = try await activeIndexer.query(query)
+
+    let end = DispatchTime.now()
+    let nanoTime = end.uptimeNanoseconds - start.uptimeNanoseconds
+    let timeInterval = Double(nanoTime) / 1_000_000.0
+
+    print("Benchmark complete: fuzzy search took \(timeInterval) ms")
+
+    #expect(results.count >= 1)
+    #expect(results[0].metadata.filename == "ApplicationCache")
+    #expect(timeInterval < 50.0)
+}
+
+@Test("Case-sensitive fuzzy search is not rejected by the persisted mask")
+func caseSensitiveFuzzyMaskIsSafe() async throws {
+    let dir = NSTemporaryDirectory() + UUID().uuidString + "/"
+    try FileManager.default.createDirectory(atPath: dir, withIntermediateDirectories: true)
+    defer { try? FileManager.default.removeItem(atPath: dir) }
+    let path = dir + "ABC.txt"
+    try "x".write(toFile: path, atomically: true, encoding: .utf8)
+    let indexer = try FileIndexer(configuration: IndexerConfiguration(roots: [URL(fileURLWithPath: dir)], databasePath: dir + "case.db"))
+    await indexer.upsert(path: path)
+    let query = SearchQuery(raw: "ABC", terms: ["ABC"], isCaseSensitive: true, mode: .filenameOnly, filenameMatchMode: .fuzzy, limit: 10)
+    let results = try await indexer.query(query)
+    #expect(results.map(\.metadata.filename).contains("ABC.txt"))
+}
+
+@Test("Multi-token fuzzy search scores tokens independently")
+func multiTokenFuzzySearch() async throws {
+    let dir = NSTemporaryDirectory() + UUID().uuidString + "/"
+    try FileManager.default.createDirectory(atPath: dir, withIntermediateDirectories: true)
+    defer { try? FileManager.default.removeItem(atPath: dir) }
+    let path = dir + "ApplicationCache.txt"
+    try "x".write(toFile: path, atomically: true, encoding: .utf8)
+    let indexer = try FileIndexer(configuration: IndexerConfiguration(roots: [URL(fileURLWithPath: dir)], databasePath: dir + "tokens.db"))
+    await indexer.upsert(path: path)
+    let query = SearchQuery(raw: "app cache", terms: ["app", "cache"], mode: .filenameOnly, filenameMatchMode: .fuzzy, limit: 10)
+    let results = try await indexer.query(query)
+    #expect(results.count == 1)
+    #expect(results[0].metadata.filename == "ApplicationCache.txt")
+}
+
+@Test("Coordinator preserves explicit offset and limit after relevance sorting")
+func coordinatorPreservesPaging() async throws {
+    let dir = NSTemporaryDirectory() + UUID().uuidString + "/"
+    try FileManager.default.createDirectory(atPath: dir, withIntermediateDirectories: true)
+    defer { try? FileManager.default.removeItem(atPath: dir) }
+    for name in ["report.txt", "report-old.txt", "my-report.txt"] { try "x".write(toFile: dir + name, atomically: true, encoding: .utf8) }
+    let indexer = try FileIndexer(configuration: IndexerConfiguration(roots: [URL(fileURLWithPath: dir)], databasePath: dir + "paging.db"))
+    for name in ["report.txt", "report-old.txt", "my-report.txt"] { await indexer.upsert(path: dir + name) }
+    let coordinator = SearchCoordinator(indexer: indexer, ripgrepSearcher: RipgrepSearcher(configuration: RipgrepConfiguration(executablePath: "/missing/rg")), roots: [URL(fileURLWithPath: dir)])
+    var query = SearchQuery(raw: "report", terms: ["report"], mode: .filenameOnly, filenameMatchMode: .fuzzy, limit: 1, offset: 1)
+    query.sortOption = SortOption(field: .relevance, direction: .descending)
+    let response = await coordinator.search(query: query)
+    #expect(response.results.count == 1)
+    #expect(response.results[0].metadata.filename == "report-old.txt")
+}
+
+@Test("Coordinator exposes file-index query errors")
+func coordinatorExposesIndexErrors() async throws {
+    let dir = NSTemporaryDirectory() + UUID().uuidString + "/"
+    try FileManager.default.createDirectory(atPath: dir, withIntermediateDirectories: true)
+    defer { try? FileManager.default.removeItem(atPath: dir) }
+    let indexer = try FileIndexer(configuration: IndexerConfiguration(roots: [URL(fileURLWithPath: dir)], databasePath: dir + "errors.db"))
+    let coordinator = SearchCoordinator(indexer: indexer, ripgrepSearcher: RipgrepSearcher(configuration: RipgrepConfiguration(executablePath: "/missing/rg")), roots: [URL(fileURLWithPath: dir)])
+    let query = SearchQuery(raw: "x", terms: ["x"], pathPrefix: dir + "missing", mode: .filenameOnly)
+    let response = await coordinator.search(query: query)
+    #expect(response.indexError == .invalidPathPrefix(dir + "missing"))
+}
+
+@Test("QueryParser parses paging and sort directives")
+func queryParserParsesPagingAndSort() {
+    let query = QueryParser.parse("report fuzzy:true sort:size order:desc limit:25 offset:50")
+    #expect(query.filenameMatchMode == .fuzzy)
+    #expect(query.sortOption == SortOption(field: .size, direction: .descending))
+    #expect(query.limit == 25)
+    #expect(query.offset == 50)
+    #expect(query.terms == ["report"])
+}
+
+@Test("Unicode case-folded masks remain compatible")
+func unicodeCaseFoldedMasksRemainCompatible() {
+    let candidate = FuzzyMatcher.characterMask(for: "Ärger", caseSensitive: false)
+    let query = FuzzyMatcher.characterMask(for: "är", caseSensitive: false)
+    #expect((candidate & query) == query)
 }

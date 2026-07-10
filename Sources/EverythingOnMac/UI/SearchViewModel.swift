@@ -14,6 +14,9 @@ final class SearchViewModel: ObservableObject {
     @Published var volumeCapabilities: [VolumeCapabilities] = []
     @Published var isIndexing = false
     @Published var lastError: String?
+    @Published var isTruncated = false
+    @Published var sortField: SortField = .relevance
+    @Published var sortDirection: SortDirection = .descending
 
     private let coordinator: SearchCoordinator
     private var searchTask: Task<Void, Never>?
@@ -21,16 +24,36 @@ final class SearchViewModel: ObservableObject {
 
     init(roots: [URL] = [URL(fileURLWithPath: NSHomeDirectory())]) {
         let excluded = ["/System", "/private/var", "/Library/Caches"]
-        let indexer = FileIndexer(configuration: IndexerConfiguration(roots: roots, excludedPaths: excluded))
-        let ripgrep = RipgrepSearcher(configuration: RipgrepConfiguration())
-        self.coordinator = SearchCoordinator(indexer: indexer, ripgrepSearcher: ripgrep, roots: roots)
-        self.volumeCapabilities = coordinator.inspectVolumes()
-        self.eventMonitor = FileSystemEventMonitor(roots: roots) { [coordinator] changes in
-            Task { await coordinator.apply(changes: changes) }
+        do {
+            let indexer = try FileIndexer(configuration: IndexerConfiguration(roots: roots, excludedPaths: excluded))
+            let ripgrep = RipgrepSearcher(configuration: RipgrepConfiguration())
+            self.coordinator = SearchCoordinator(indexer: indexer, ripgrepSearcher: ripgrep, roots: roots)
+            self.volumeCapabilities = coordinator.inspectVolumes()
+            self.eventMonitor = FileSystemEventMonitor(roots: roots) { [coordinator] changes, eventID in
+                Task { await coordinator.apply(changes: changes, eventID: eventID) }
+            }
+            
+            Task {
+                let lastEvent = await coordinator.lastEventID()
+                if let lastEvent {
+                    self.eventMonitor?.start(sinceEventId: lastEvent)
+                } else {
+                    self.eventMonitor?.start()
+                }
+                await setupIndex()
+            }
+        } catch {
+            fatalError("Failed to initialize FileIndexer: \(error)")
         }
-        self.eventMonitor?.start()
+    }
 
-        Task { await rebuildIndex() }
+    func setupIndex() async {
+        let count = await coordinator.indexedItemCount()
+        if count > 0 {
+            indexedCount = count
+        } else {
+            await rebuildIndex()
+        }
     }
 
     func rebuildIndex() async {
@@ -46,11 +69,19 @@ final class SearchViewModel: ObservableObject {
             try? await Task.sleep(for: .milliseconds(160))
             if Task.isCancelled { return }
 
-            let query = QueryParser.parse(queryText, mode: mode)
-            let merged = await coordinator.search(query: query)
-            if Task.isCancelled { return }
-            self.results = merged
-            self.lastError = nil
+            var query = QueryParser.parse(queryText, mode: mode)
+            if query.sortOption == nil {
+                query.sortOption = SortOption(field: sortField, direction: sortDirection)
+            }
+
+            let responses = await coordinator.searchStream(query: query)
+            for await response in responses {
+                if Task.isCancelled { return }
+                self.results = response.results
+                self.isTruncated = response.isTruncated
+                self.lastError = response.indexError?.localizedDescription
+                    ?? response.contentError?.localizedDescription
+            }
         }
     }
 

@@ -1,38 +1,65 @@
 # EverythingOnMac
 
-适用于 Mac OS 的本地文件与文本内容极速搜索应用，目标体验参考 Everything + Total Commander。
+macOS 本地文件名与正文搜索应用，目标体验参考 Everything 与 Total Commander。
 
-## 当前实现（MVP 基线）
+## 当前实现
 
-- 文件名/路径索引搜索（内存索引，支持排除目录）
-- APFS 友好的元数据采集：通过 macOS `statfs`/URL resource values 读取卷格式、持久 File ID 能力，并在索引中保留文件系统资源标识
-- FSEvents 增量监听：macOS 下监听文件创建、修改、删除并增量更新索引
-- ripgrep 正文检索通道（自动发现 `rg`，支持 `RG_PATH`/PATH 环境变量覆盖，结构化 JSON 结果解析）
-- 混合查询编排（文件索引结果 + 正文命中结果合并）
-- SwiftUI macOS 原生界面（双击在 Finder 中定位）
-- 查询语法支持：
-  - `path:/some/dir`
-  - `ext:swift`
-  - `-excludeTerm`
-  - `regex:true`
-  - `case:true`
+- SQLite 持久化文件索引，默认数据库位于 `~/Library/Application Support/EverythingOnMac/everything.db`
+- `searchfs` 全卷快速扫描，失败时回退 `FileManager` 递归枚举
+- FSEvents 增量监听并保存最后 Event ID
+- literal、regex、fuzzy 三种文件名匹配模式
+- SQLite 自定义函数：`REGEXP_LIKE`、`CHARACTER_MASK`、`FUZZY_SCORE`
+- ripgrep JSON 流式正文搜索，支持 timeout、取消和错误传播
+- 文件名与正文结果流式合并、相关性排序、Top-K 展示
+- SwiftUI 原生界面，双击在 Finder 中定位
+- Release `.app` 与 `.zip` 打包脚本
 
-## 架构分层
+## 查询语法
 
-- `EverythingOnMacCore`
-  - `Parsing/QueryParser.swift`：查询表达式解析
-  - `Services/FileIndexer.swift`：文件索引扫描、文件名查询、增量 upsert/remove
-  - `Services/APFSVolumeInspector.swift`：APFS/卷能力探测，用于展示当前索引根目录的文件系统能力
-  - `Services/FileSystemEventMonitor.swift`：macOS FSEvents 监听，驱动索引增量刷新
-  - `Services/RipgrepSearcher.swift`：rg 调用与正文命中解析
-  - `Orchestration/SearchCoordinator.swift`：双通道查询、结果融合、索引更新编排
-- `EverythingOnMac`
-  - `UI/ContentView.swift`：主界面
-  - `UI/SearchViewModel.swift`：UI 状态、节流、触发查询、文件系统事件接入
+```text
+path:/some/dir
+ext:swift
+-excludedTerm
+regex:true
+fuzzy:true
+case:true
+size:>10M
+date:>=2026-07-01
+uti:public.image
+sort:relevance
+sort:path
+sort:filename
+sort:size
+sort:date
+order:asc
+order:desc
+limit:100
+offset:200
+```
 
-## 运行
+示例：
 
-> 需要在 macOS 环境运行 UI。Linux 环境可构建核心库并运行测试。
+```text
+report fuzzy:true ext:pdf sort:relevance limit:50
+```
+
+## 架构
+
+```text
+CSearchFS              searchfs C 封装
+EverythingOnMacCore    索引、查询、FSEvents、ripgrep、协调器
+EverythingOnMac        SwiftUI App
+```
+
+详细说明：
+
+- [当前架构与实现](docs/ARCHITECTURE_AND_CLEANUP.md)
+- [编译与打包 App](docs/BUILD_AND_PACKAGE_APP.md)
+- [权限与 Sandbox](docs/SANDBOX_AND_PERMISSIONS.md)
+
+## 构建与测试
+
+要求 macOS 14+、Swift tools 6.1 对应工具链。
 
 ```bash
 swift build
@@ -40,10 +67,34 @@ swift test
 swift run EverythingOnMac
 ```
 
-`rg` 会按如下顺序自动发现：`RG_PATH`、`/opt/homebrew/bin/rg`、`/usr/local/bin/rg`、`/usr/bin/rg`，最后回退到 PATH 中的 `rg`。
+## 打包 `.app`
 
-## 下一步
+```bash
+./scripts/build_app.sh
+```
 
-- 持久化索引（SQLite/LMDB）以支持百万级文件冷启动
-- 增加结果分页/排序策略与更多过滤条件（大小、时间、UTType）
-- 增强权限与发布策略（Full Disk Access / 沙盒策略）
+输出：
+
+```text
+dist/EverythingOnMac.app
+dist/EverythingOnMac.zip
+```
+
+当前脚本生成本机架构、ad-hoc 签名的开发测试版本，不是 Developer ID 公证或 universal 发行版。
+
+## ripgrep 查找顺序
+
+1. `RG_PATH`
+2. App Bundle Resources
+3. `/opt/homebrew/bin/rg`
+4. `/usr/local/bin/rg`
+5. `/usr/bin/rg`
+6. `PATH`
+
+## 当前主要限制
+
+-完整路径未持久化，超大结果集的 `sort:path` 只保证候选池内正确
+- FSEvents 尚未完整处理事件丢失和强制重扫 flag
+-启动只按数据库行数判断索引是否可用
+-当前 App 没有正式签名、公证、图标或 Sandbox entitlements
+-默认打包不是 universal binary

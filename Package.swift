@@ -10,7 +10,11 @@ let package = Package(
     ],
     targets: [
         .target(
-            name: "EverythingOnMacCore"
+            name: "CSearchFS"
+        ),
+        .target(
+            name: "EverythingOnMacCore",
+            dependencies: ["CSearchFS"]
         ),
         .executableTarget(
             name: "EverythingOnMac",
