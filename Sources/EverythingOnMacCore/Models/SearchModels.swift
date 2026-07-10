@@ -123,6 +123,51 @@ public struct FileIdentity: Sendable, Hashable {
     }
 }
 
+public struct IndexedEntry: Sendable, Hashable {
+    public let entryID: Int64
+    public let identity: FileIdentity
+    public let path: String
+    public let filename: String
+    public let fileExtension: String
+    public let size: Int64
+    public let modificationDate: Date?
+    public let uti: String?
+
+    public init(
+        entryID: Int64,
+        identity: FileIdentity,
+        path: String,
+        filename: String,
+        fileExtension: String,
+        size: Int64,
+        modificationDate: Date?,
+        uti: String?
+    ) {
+        self.entryID = entryID
+        self.identity = identity
+        self.path = path
+        self.filename = filename
+        self.fileExtension = fileExtension
+        self.size = size
+        self.modificationDate = modificationDate
+        self.uti = uti
+    }
+
+    public var metadata: FileMetadata {
+        FileMetadata(
+            path: path,
+            filename: filename,
+            fileExtension: fileExtension,
+            size: size,
+            modificationDate: modificationDate,
+            volumeUUID: identity.volumeUUID,
+            fileID: identity.fileID,
+            entryID: entryID,
+            uti: uti
+        )
+    }
+}
+
 public struct FileMetadata: Sendable, Hashable {
     public var path: String
     public var filename: String

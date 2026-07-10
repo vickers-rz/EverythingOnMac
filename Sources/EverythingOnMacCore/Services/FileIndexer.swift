@@ -110,6 +110,25 @@ public struct FileIndexQueryResult: Sendable, Equatable {
     }
 }
 
+public struct ContentCandidateResult: Sendable, Equatable {
+    public let entries: [IndexedEntry]
+    public let skippedCorruptNodeCount: Int
+    public let firstCorruptionDescription: String?
+    public let isTruncated: Bool
+
+    public init(
+        entries: [IndexedEntry],
+        skippedCorruptNodeCount: Int,
+        firstCorruptionDescription: String?,
+        isTruncated: Bool
+    ) {
+        self.entries = entries
+        self.skippedCorruptNodeCount = skippedCorruptNodeCount
+        self.firstCorruptionDescription = firstCorruptionDescription
+        self.isTruncated = isTruncated
+    }
+}
+
 public actor FileIndexer {
     static let objectUpsertSQL = """
         INSERT INTO fs_objects
@@ -492,6 +511,109 @@ public actor FileIndexer {
             entryID: entryID,
             uti: row["uti"] as? String
         ), source: [.filenameIndex])
+    }
+
+    public func contentCandidates(for query: SearchQuery, limit: Int) async throws -> ContentCandidateResult {
+        try await ensureCacheLoaded()
+        let boundedLimit = max(1, limit)
+        var cte = ""
+        var cteBindings: [Any] = []
+        var predicates = ["o.is_directory = 0"]
+        var bindings: [Any] = []
+
+        if let rawPrefix = query.pathPrefix {
+            let prefix = Self.canonicalUserPath(rawPrefix)
+            guard FileManager.default.fileExists(atPath: prefix),
+                  let values = try? URL(fileURLWithPath: prefix).resourceValues(forKeys: [.fileResourceIdentifierKey, .volumeUUIDStringKey]),
+                  let fileID = normalizeFileID(values.fileResourceIdentifier),
+                  let volume = values.volumeUUIDString else {
+                throw FileIndexSearchError.invalidPathPrefix(rawPrefix)
+            }
+            cte = """
+                WITH RECURSIVE path_descendants(fid) AS (
+                    SELECT ?
+                    UNION
+                    SELECT e.target_file_id
+                    FROM fs_entries e
+                    JOIN fs_objects o ON o.volume_uuid = e.volume_uuid AND o.file_id = e.target_file_id
+                    JOIN path_descendants p ON e.parent_file_id = p.fid
+                    WHERE e.volume_uuid = ? AND o.is_directory = 1
+                )
+                """
+            cteBindings = [Int64(bitPattern: fileID), volume]
+            predicates += [
+                "e.volume_uuid = ?",
+                "(e.parent_file_id IN (SELECT fid FROM path_descendants) OR e.target_file_id IN (SELECT fid FROM path_descendants))"
+            ]
+            bindings.append(volume)
+        }
+
+        if !query.fileExtensions.isEmpty {
+            let extensions = query.fileExtensions.map { $0.lowercased() }.sorted()
+            predicates.append("o.file_extension IN (\(Array(repeating: "?", count: extensions.count).joined(separator: ",")))")
+            bindings += extensions
+        }
+        for excluded in query.excludedTerms where !excluded.isEmpty {
+            predicates.append(query.isCaseSensitive ? "e.name NOT GLOB ?" : "e.name NOT LIKE ?")
+            bindings.append(query.isCaseSensitive ? "*\(excluded)*" : "%\(excluded)%")
+        }
+        if let value = query.minSize, let op = query.minSizeOp { predicates.append("o.size \(op) ?"); bindings.append(value) }
+        if let value = query.maxSize, let op = query.maxSizeOp { predicates.append("o.size \(op) ?"); bindings.append(value) }
+        if let value = query.minDate, let op = query.minDateOp { predicates.append("o.modification_date \(op) ?"); bindings.append(value.timeIntervalSince1970) }
+        if let value = query.maxDate, let op = query.maxDateOp { predicates.append("o.modification_date \(op) ?"); bindings.append(value.timeIntervalSince1970) }
+        if let uti = query.utiFilter, !uti.isEmpty { predicates.append("o.uti LIKE ?"); bindings.append("%\(uti)%") }
+
+        let sql = """
+            \(cte)
+            SELECT e.entry_id, e.volume_uuid, e.parent_file_id, e.target_file_id, e.name,
+                   o.file_extension, o.size, o.modification_date, o.uti
+            FROM fs_entries e
+            JOIN fs_objects o ON o.volume_uuid = e.volume_uuid AND o.file_id = e.target_file_id
+            WHERE \(predicates.joined(separator: " AND "))
+            ORDER BY e.volume_uuid, e.target_file_id, e.entry_id
+            LIMIT ?;
+            """
+        var allBindings = cteBindings + bindings
+        allBindings.append(boundedLimit + 1)
+        let rows = try database.query(sql: sql, bindings: allBindings)
+
+        var entries: [IndexedEntry] = []
+        entries.reserveCapacity(min(rows.count, boundedLimit))
+        var skipped = 0
+        var firstCorruption: String?
+        for row in rows.prefix(boundedLimit) {
+            try Task.checkCancellation()
+            do {
+                guard let entryID = row["entry_id"] as? Int64,
+                      let volume = row["volume_uuid"] as? String,
+                      let parent = row["parent_file_id"] as? Int64,
+                      let target = row["target_file_id"] as? Int64,
+                      let name = row["name"] as? String else {
+                    throw FileIndexSearchError.indexCorrupted("正文候选记录缺少必要字段。")
+                }
+                let path = try resolvePath(volumeUUID: volume, parentID: UInt64(bitPattern: parent), name: name)
+                guard !shouldExclude(path) else { continue }
+                entries.append(IndexedEntry(
+                    entryID: entryID,
+                    identity: FileIdentity(volumeUUID: volume, fileID: UInt64(bitPattern: target)),
+                    path: path,
+                    filename: name,
+                    fileExtension: row["file_extension"] as? String ?? "",
+                    size: row["size"] as? Int64 ?? 0,
+                    modificationDate: (row["modification_date"] as? Double).map(Date.init(timeIntervalSince1970:)),
+                    uti: row["uti"] as? String
+                ))
+            } catch {
+                skipped += 1
+                if firstCorruption == nil { firstCorruption = error.localizedDescription }
+            }
+        }
+        return ContentCandidateResult(
+            entries: entries,
+            skippedCorruptNodeCount: skipped,
+            firstCorruptionDescription: firstCorruption,
+            isTruncated: rows.count > boundedLimit
+        )
     }
 
     public func itemCount() async -> Int {

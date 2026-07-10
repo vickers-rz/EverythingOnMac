@@ -540,14 +540,24 @@ func searchCoordinatorBatchesStreamingUpdates() async throws {
     let tempDir = canonicalPath(for: rawTempDir) + "/"
     defer { try? FileManager.default.removeItem(atPath: tempDir) }
 
-    let jsonLines = (1...10).map { index in
-        "{\"type\":\"match\",\"data\":{\"path\":{\"text\":\"/tmp/item_\(index).txt\"},\"lines\":{\"text\":\"match \(index)\\\\n\"},\"line_number\":\(index),\"submatches\":[{\"start\":0}]}}"
-    }.joined(separator: "\n")
+    let filePaths = try (1...10).map { index in
+        let path = tempDir + "item_\(index).txt"
+        try "match \(index)".write(toFile: path, atomically: true, encoding: .utf8)
+        return path
+    }
     let script = try makeExecutableScript(contents: """
-    #!/bin/sh
-    cat <<'JSON'
-    \(jsonLines)
-    JSON
+    #!/usr/bin/env python3
+    import json, os, sys
+    for index, path in enumerate((arg for arg in sys.argv[1:] if os.path.isfile(arg)), 1):
+        print(json.dumps({
+            "type": "match",
+            "data": {
+                "path": {"text": path},
+                "lines": {"text": f"match {index}\\n"},
+                "line_number": index,
+                "submatches": [{"start": 0}]
+            }
+        }), flush=True)
     """)
     defer { try? FileManager.default.removeItem(atPath: script) }
 
@@ -555,6 +565,7 @@ func searchCoordinatorBatchesStreamingUpdates() async throws {
         roots: [URL(fileURLWithPath: tempDir)],
         databasePath: tempDir + "stream_batch.db"
     ))
+    for path in filePaths { try await indexer.upsert(path: path) }
     let searcher = RipgrepSearcher(configuration: RipgrepConfiguration(
         executablePath: script,
         timeoutSeconds: 15
@@ -820,6 +831,75 @@ func hardlinkIndexingAndRemoval() async throws {
     try await indexer.remove(path: linked)
     let remainingObjects = try db.query(sql: "SELECT COUNT(*) AS count FROM fs_objects WHERE file_id = ?;", bindings: [Int64(bitPattern: all[0].metadata.fileID!)])
     #expect(remainingObjects.first?["count"] as? Int64 == 0)
+}
+
+@Test("Content search scans one hardlink path and maps matches to every entry")
+func hardlinkContentSearchDeduplicatesReads() async throws {
+    let root = canonicalPath(for: NSTemporaryDirectory() + UUID().uuidString) + "/"
+    let dirA = root + "A/"
+    let dirB = root + "B/"
+    try FileManager.default.createDirectory(atPath: dirA, withIntermediateDirectories: true)
+    try FileManager.default.createDirectory(atPath: dirB, withIntermediateDirectories: true)
+    defer { try? FileManager.default.removeItem(atPath: root) }
+
+    let original = dirA + "report.txt"
+    let linked = dirB + "report-copy.txt"
+    try "shared needle".write(toFile: original, atomically: true, encoding: .utf8)
+    try FileManager.default.linkItem(atPath: original, toPath: linked)
+    let scanLog = root + "scanned-paths.log"
+    let escapedLog = scanLog.replacingOccurrences(of: "\\", with: "\\\\")
+        .replacingOccurrences(of: "\"", with: "\\\"")
+    let script = try makeExecutableScript(contents: """
+    #!/usr/bin/env python3
+    import json, os, sys
+    paths = [arg for arg in sys.argv[1:] if os.path.isfile(arg)]
+    with open("\(escapedLog)", "a", encoding="utf-8") as handle:
+        for path in paths:
+            handle.write(path + "\\n")
+    if paths:
+        print(json.dumps({
+            "type": "match",
+            "data": {
+                "path": {"text": paths[0]},
+                "lines": {"text": "shared needle\\n"},
+                "line_number": 1,
+                "submatches": [{"start": 7}]
+            }
+        }))
+    """)
+    defer { try? FileManager.default.removeItem(atPath: script) }
+
+    let indexer = try FileIndexer(configuration: IndexerConfiguration(
+        roots: [URL(fileURLWithPath: root)],
+        databasePath: root + "content-hardlinks.db",
+        useFastVolumeScan: false
+    ))
+    try await indexer.upsert(path: dirA)
+    try await indexer.upsert(path: dirB)
+    try await indexer.upsert(path: original)
+    try await indexer.upsert(path: linked)
+
+    let coordinator = SearchCoordinator(
+        indexer: indexer,
+        ripgrepSearcher: RipgrepSearcher(configuration: RipgrepConfiguration(
+            executablePath: script,
+            timeoutSeconds: 15
+        )),
+        roots: [URL(fileURLWithPath: root)]
+    )
+    let response = await coordinator.search(query: QueryParser.parse("shared needle", mode: .contentOnly))
+    let hardlinkResults = response.results.filter { $0.metadata.filename.hasPrefix("report") }
+    #expect(hardlinkResults.count == 2)
+    #expect(Set(hardlinkResults.compactMap(\.metadata.fileID)).count == 1)
+    #expect(Set(hardlinkResults.compactMap(\.metadata.entryID)).count == 2)
+    #expect(hardlinkResults.allSatisfy { $0.source.contains(.contentRipgrep) })
+
+    let scannedPaths = try String(contentsOfFile: scanLog, encoding: .utf8)
+        .split(separator: "\n").map(String.init)
+    #expect(scannedPaths.count == 1)
+    let canonicalOriginal = canonicalPath(for: original)
+    let canonicalLinked = canonicalPath(for: linked)
+    #expect(scannedPaths[0] == canonicalOriginal || scannedPaths[0] == canonicalLinked)
 }
 
 @Test("Benchmark fuzzy query with bitmask pre-filtering on 10000 synthetic rows")

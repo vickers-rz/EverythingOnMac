@@ -109,11 +109,44 @@ public actor SearchCoordinator {
                 var lastFlush = clock.now
 
                 do {
-                    let stream = await ripgrepSearcher.stream(query: query, roots: roots)
+                    let candidateResult = try await indexer.contentCandidates(
+                        for: query,
+                        limit: policy.maximumCandidateLimit
+                    )
+                    indexWasTruncated = indexWasTruncated || candidateResult.isTruncated
+                    skippedCorruptNodeCount += candidateResult.skippedCorruptNodeCount
+                    if firstCorruptionDescription == nil {
+                        firstCorruptionDescription = candidateResult.firstCorruptionDescription
+                    }
+
+                    let entriesByIdentity = Dictionary(grouping: candidateResult.entries, by: \.identity)
+                    var representativePathToIdentity: [String: FileIdentity] = [:]
+                    var representativePaths: [String] = []
+                    representativePaths.reserveCapacity(entriesByIdentity.count)
+                    for (identity, entries) in entriesByIdentity {
+                        guard let representative = entries.first(where: {
+                            FileManager.default.isReadableFile(atPath: $0.path)
+                        }) else { continue }
+                        representativePaths.append(representative.path)
+                        representativePathToIdentity[representative.path] = identity
+                    }
+
+                    let stream = await ripgrepSearcher.stream(query: query, paths: representativePaths)
                     for try await item in stream {
                         try Task.checkCancellation()
-                        Self.merge(item, into: &mergedByPath, matchLimit: policy.maximumContentMatchesPerFile)
-                        pendingCount += 1
+                        guard let identity = representativePathToIdentity[item.metadata.path],
+                              let entries = entriesByIdentity[identity] else { continue }
+
+                        for entry in entries {
+                            let mapped = SearchResult(
+                                metadata: entry.metadata,
+                                source: [.contentRipgrep],
+                                contentMatches: item.contentMatches,
+                                totalContentMatchCount: item.totalContentMatchCount
+                            )
+                            Self.merge(mapped, into: &mergedByPath, matchLimit: policy.maximumContentMatchesPerFile)
+                            pendingCount += 1
+                        }
 
                         let now = clock.now
                         if !yieldedContent || pendingCount >= streamBatchSize || lastFlush.duration(to: now) >= streamFlushInterval {

@@ -92,58 +92,72 @@ public actor RipgrepSearcher {
         query: SearchQuery,
         roots: [URL]
     ) -> AsyncThrowingStream<SearchResult, Error> {
-        guard query.hasContentPattern, query.mode != .filenameOnly else {
-            return AsyncThrowingStream { continuation in
-                continuation.finish()
-            }
-        }
-
         let pattern = query.terms.joined(separator: " ")
-        guard !pattern.isEmpty else {
-            return AsyncThrowingStream { continuation in
-                continuation.finish()
-            }
+        guard query.hasContentPattern, query.mode != .filenameOnly, !pattern.isEmpty else {
+            return AsyncThrowingStream { $0.finish() }
         }
+        let paths = contentRoots(for: query, roots: roots).map(\.path)
+        return makeStream(argumentBatches: [makeArguments(query: query, paths: paths, pattern: pattern)])
+    }
 
-        let arguments = makeArguments(query: query, roots: roots, pattern: pattern)
+    public func stream(
+        query: SearchQuery,
+        paths: [String]
+    ) -> AsyncThrowingStream<SearchResult, Error> {
+        let pattern = query.terms.joined(separator: " ")
+        guard query.hasContentPattern, query.mode != .filenameOnly, !pattern.isEmpty, !paths.isEmpty else {
+            return AsyncThrowingStream { $0.finish() }
+        }
+        let batches = chunkedPaths(paths, maximumArgumentBytes: 96 * 1024)
+            .map { makeArguments(query: query, paths: $0, pattern: pattern) }
+        return makeStream(argumentBatches: batches)
+    }
+
+    private func makeStream(argumentBatches: [[String]]) -> AsyncThrowingStream<SearchResult, Error> {
         let searchID = UUID()
-
         return AsyncThrowingStream { continuation in
             let executionTask = Task {
                 await self.executeStreaming(
-                    arguments: arguments,
+                    argumentBatches: argumentBatches,
                     searchID: searchID,
                     continuation: continuation
                 )
             }
-
             continuation.onTermination = { @Sendable _ in
                 executionTask.cancel()
-                Task {
-                    await self.cancelSearch(searchID: searchID)
-                }
+                Task { await self.cancelSearch(searchID: searchID) }
             }
         }
     }
 
-    private func makeArguments(query: SearchQuery, roots: [URL], pattern: String) -> [String] {
-        var arguments = ["--json", "--line-number", "--column", "--color", "never", "--no-heading"]
-        if !query.isRegex {
-            arguments.append("--fixed-strings")
-        }
-        arguments.append(pattern)
+    private func makeArguments(query: SearchQuery, paths: [String], pattern: String) -> [String] {
+        var arguments = [
+            "--json", "--line-number", "--column", "--color", "never",
+            "--no-heading", "--with-filename"
+        ]
+        if !query.isRegex { arguments.append("--fixed-strings") }
         arguments.append(query.isCaseSensitive ? "--case-sensitive" : "--ignore-case")
-
-        for ext in query.fileExtensions {
-            arguments.append(contentsOf: ["-g", "*.\(ext)"])
-        }
-        for excluded in query.excludedTerms {
-            arguments.append(contentsOf: ["-g", "!*\(excluded)*"])
-        }
-        for root in contentRoots(for: query, roots: roots) {
-            arguments.append(root.path)
-        }
+        arguments.append(contentsOf: ["--regexp", pattern, "--"])
+        arguments.append(contentsOf: paths)
         return sanitize(arguments)
+    }
+
+    private func chunkedPaths(_ paths: [String], maximumArgumentBytes: Int) -> [[String]] {
+        var batches: [[String]] = []
+        var current: [String] = []
+        var currentBytes = 0
+        for path in paths {
+            let bytes = path.utf8.count + 1
+            if !current.isEmpty && currentBytes + bytes > maximumArgumentBytes {
+                batches.append(current)
+                current = []
+                currentBytes = 0
+            }
+            current.append(path)
+            currentBytes += bytes
+        }
+        if !current.isEmpty { batches.append(current) }
+        return batches
     }
 
     private func contentRoots(for query: SearchQuery, roots: [URL]) -> [URL] {
@@ -164,7 +178,7 @@ public actor RipgrepSearcher {
     }
 
     private func executeStreaming(
-        arguments: [String],
+        argumentBatches: [[String]],
         searchID: UUID,
         continuation: AsyncThrowingStream<SearchResult, Error>.Continuation
     ) async {
@@ -174,9 +188,33 @@ public actor RipgrepSearcher {
             return
         }
 
-        if let activeProcess, activeProcess.isRunning {
-            activeProcess.terminate()
+        do {
+            for arguments in argumentBatches {
+                try Task.checkCancellation()
+                try await executeBatch(
+                    executablePath: executablePath,
+                    arguments: arguments,
+                    searchID: searchID,
+                    continuation: continuation
+                )
+            }
+            continuation.finish()
+        } catch is CancellationError {
+            continuation.finish(throwing: RipgrepSearchError.cancelled)
+        } catch let error as RipgrepSearchError {
+            continuation.finish(throwing: error)
+        } catch {
+            continuation.finish(throwing: RipgrepSearchError.launchFailed(error.localizedDescription))
         }
+    }
+
+    private func executeBatch(
+        executablePath: String,
+        arguments: [String],
+        searchID: UUID,
+        continuation: AsyncThrowingStream<SearchResult, Error>.Continuation
+    ) async throws {
+        if let activeProcess, activeProcess.isRunning { activeProcess.terminate() }
 
         let process = Process()
         process.executableURL = URL(fileURLWithPath: executablePath)
@@ -186,22 +224,10 @@ public actor RipgrepSearcher {
         let stderrPipe = Pipe()
         process.standardOutput = stdoutPipe
         process.standardError = stderrPipe
-
         activeProcess = process
         activeSearchID = searchID
 
-        defer {
-            if activeSearchID == searchID {
-                activeProcess = nil
-                activeSearchID = nil
-            }
-        }
-
-        // Attach both readers before launching the child. Very short-lived commands can
-        // otherwise exit before the asynchronous readers begin consuming their pipes.
-        let stderrTask = Task {
-            await Self.readToEnd(stderrPipe.fileHandleForReading)
-        }
+        let stderrTask = Task { await Self.readToEnd(stderrPipe.fileHandleForReading) }
         let stdoutTask = Task {
             try await Self.consumeJSONLines(
                 from: stdoutPipe.fileHandleForReading,
@@ -211,39 +237,25 @@ public actor RipgrepSearcher {
 
         do {
             try process.run()
-        } catch {
-            stdoutTask.cancel()
-            stderrTask.cancel()
-            continuation.finish(throwing: RipgrepSearchError.launchFailed(error.localizedDescription))
-            return
-        }
-
-        do {
             let exitCode = try await waitForExit(process)
             try Task.checkCancellation()
             try await stdoutTask.value
             let stderr = await stderrTask.value
-
             guard exitCode == 0 || exitCode == 1 else {
                 throw RipgrepSearchError.failed(
                     exitCode: exitCode,
                     stderr: limitedStderr(from: stderr)
                 )
             }
-            continuation.finish()
-        } catch is CancellationError {
-            terminate(process)
-            stdoutTask.cancel()
-            stderrTask.cancel()
-            continuation.finish(throwing: RipgrepSearchError.cancelled)
-        } catch let error as RipgrepSearchError {
-            terminate(process)
-            stdoutTask.cancel()
-            continuation.finish(throwing: error)
         } catch {
             terminate(process)
             stdoutTask.cancel()
-            continuation.finish(throwing: RipgrepSearchError.launchFailed(error.localizedDescription))
+            stderrTask.cancel()
+            throw error
+        }
+
+        if activeSearchID == searchID {
+            activeProcess = nil
         }
     }
 
