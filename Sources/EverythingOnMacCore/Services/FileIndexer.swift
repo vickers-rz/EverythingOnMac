@@ -23,19 +23,24 @@ public struct IndexerConfiguration: Sendable {
 // Helper class for collecting searchfs callbacks
 private final class ScanContext {
     var matches: [[Any]] = []
+    var writeError: Error?
     let volumeUUID: String
     let database: SQLiteDatabase
-    
+
     init(volumeUUID: String, database: SQLiteDatabase) {
         self.volumeUUID = volumeUUID
         self.database = database
     }
-    
+
     func flush() {
-        guard !matches.isEmpty else { return }
+        guard writeError == nil, !matches.isEmpty else { return }
         let sql = "INSERT OR REPLACE INTO fs_nodes (volume_uuid, file_id, parent_id, name, name_character_mask, is_directory, file_extension, size, modification_date, uti) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?);"
-        try? database.executeBatch(sql: sql, items: matches)
-        matches.removeAll(keepingCapacity: true)
+        do {
+            try database.executeBatch(sql: sql, items: matches)
+            matches.removeAll(keepingCapacity: true)
+        } catch {
+            writeError = error
+        }
     }
 }
 
@@ -180,9 +185,9 @@ public actor FileIndexer {
         return fullPath
     }
 
-    public func rebuild() async {
+    public func rebuild() async throws {
         // Clear nodes table
-        try? database.execute(sql: "DELETE FROM fs_nodes;")
+        try database.execute(sql: "DELETE FROM fs_nodes;")
         directoryCache.removeAll()
         
         // Re-cache ancestors
@@ -207,7 +212,7 @@ public actor FileIndexer {
 
             guard configuration.useFastVolumeScan,
                   let physicalMountPoint = Self.realMountPoint(for: root.path) else {
-                scanVolumeRecursively(volumeUUID: volumeUUID, rootsOnThisVolume: rootsOnThisVolume)
+                try scanVolumeRecursively(volumeUUID: volumeUUID, rootsOnThisVolume: rootsOnThisVolume)
                 continue
             }
 
@@ -240,11 +245,14 @@ public actor FileIndexer {
             }, contextPointer)
 
             guard errCode == 0 else {
-                scanVolumeRecursively(volumeUUID: volumeUUID, rootsOnThisVolume: rootsOnThisVolume)
+                try scanVolumeRecursively(volumeUUID: volumeUUID, rootsOnThisVolume: rootsOnThisVolume)
                 continue
             }
 
             scanCtx.flush()
+            if let writeError = scanCtx.writeError {
+                throw writeError
+            }
             let rootIDs = rootsOnThisVolume.compactMap { candidate -> UInt64? in
                 let values = try? candidate.resourceValues(forKeys: [.fileResourceIdentifierKey])
                 return normalizeFileID(values?.fileResourceIdentifier)
@@ -253,7 +261,7 @@ public actor FileIndexer {
             guard rootIDs.count == rootsOnThisVolume.count else {
                 // A partial root-ID result is unsafe because pruning would silently omit unresolved roots.
                 try? database.execute(sql: "DELETE FROM fs_nodes WHERE volume_uuid = ?;", bindings: [volumeUUID])
-                scanVolumeRecursively(volumeUUID: volumeUUID, rootsOnThisVolume: rootsOnThisVolume)
+                try scanVolumeRecursively(volumeUUID: volumeUUID, rootsOnThisVolume: rootsOnThisVolume)
                 continue
             }
 
@@ -263,7 +271,7 @@ public actor FileIndexer {
             } catch {
                 // Never keep a partially pruned volume index.
                 try? database.execute(sql: "DELETE FROM fs_nodes WHERE volume_uuid = ?;", bindings: [volumeUUID])
-                scanVolumeRecursively(volumeUUID: volumeUUID, rootsOnThisVolume: rootsOnThisVolume)
+                try scanVolumeRecursively(volumeUUID: volumeUUID, rootsOnThisVolume: rootsOnThisVolume)
             }
         }
         
@@ -440,11 +448,11 @@ public actor FileIndexer {
         return 0
     }
 
-    public func upsert(path: String) async {
+    public func upsert(path: String) async throws {
         await ensureCacheLoaded()
 
         guard !shouldExclude(path) else {
-            await remove(path: path)
+            try await remove(path: path)
             return
         }
 
@@ -452,7 +460,7 @@ public actor FileIndexer {
         let keys: Set<URLResourceKey> = [.isRegularFileKey, .isDirectoryKey, .fileSizeKey, .contentModificationDateKey, .fileResourceIdentifierKey, .typeIdentifierKey, .volumeUUIDStringKey, .parentDirectoryURLKey]
         
         guard let values = try? fileURL.resourceValues(forKeys: keys) else {
-            await remove(path: path)
+            try await remove(path: path)
             return
         }
         
@@ -480,7 +488,7 @@ public actor FileIndexer {
         
         let mask = FuzzyMatcher.characterMask(for: name, caseSensitive: false)
         let sql = "INSERT OR REPLACE INTO fs_nodes (volume_uuid, file_id, parent_id, name, name_character_mask, is_directory, file_extension, size, modification_date, uti) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?);"
-        try? database.execute(sql: sql, bindings: [
+        try database.execute(sql: sql, bindings: [
             volumeUUID,
             Int64(bitPattern: fileID),
             Int64(bitPattern: parentID),
@@ -548,29 +556,55 @@ public actor FileIndexer {
         return nil
     }
 
-    private func recursiveDelete(volumeUUID: String, parentID: UInt64) {
+    private func deleteDescendants(volumeUUID: String, parentID: UInt64) throws {
+        let sql = """
+        WITH RECURSIVE descendants(fid) AS (
+            SELECT file_id FROM fs_nodes WHERE volume_uuid = ? AND parent_id = ?
+            UNION
+            SELECT n.file_id
+            FROM fs_nodes n
+            JOIN descendants d ON n.parent_id = d.fid
+            WHERE n.volume_uuid = ?
+        )
+        DELETE FROM fs_nodes
+        WHERE volume_uuid = ? AND file_id IN (SELECT fid FROM descendants);
+        """
+        try database.execute(sql: sql, bindings: [
+            volumeUUID,
+            Int64(bitPattern: parentID),
+            volumeUUID,
+            volumeUUID
+        ])
+
         guard let volumeCache = directoryCache[volumeUUID] else { return }
-        let subdirs = volumeCache.filter { $0.value.parentID == parentID }
-        for subdir in subdirs {
-            recursiveDelete(volumeUUID: volumeUUID, parentID: subdir.key)
-            directoryCache[volumeUUID]?.removeValue(forKey: subdir.key)
+        var stack = [parentID]
+        var visited = Set<UInt64>()
+        var descendants: [UInt64] = []
+
+        while let current = stack.popLast() {
+            guard visited.insert(current).inserted else { continue }
+            for (fileID, node) in volumeCache where node.parentID == current {
+                descendants.append(fileID)
+                stack.append(fileID)
+            }
         }
-        
-        let sql = "DELETE FROM fs_nodes WHERE volume_uuid = ? AND parent_id = ?;"
-        try? database.execute(sql: sql, bindings: [volumeUUID, Int64(bitPattern: parentID)])
+
+        for fileID in descendants {
+            directoryCache[volumeUUID]?.removeValue(forKey: fileID)
+        }
     }
 
-    public func remove(path: String) async {
+    public func remove(path: String) async throws {
         await ensureCacheLoaded()
 
         if let (volumeUUID, fileID) = nodeID(for: path) {
             if directoryCache[volumeUUID]?[fileID] != nil {
-                recursiveDelete(volumeUUID: volumeUUID, parentID: fileID)
+                try deleteDescendants(volumeUUID: volumeUUID, parentID: fileID)
                 directoryCache[volumeUUID]?.removeValue(forKey: fileID)
             }
-            
+
             let sql = "DELETE FROM fs_nodes WHERE volume_uuid = ? AND file_id = ?;"
-            try? database.execute(sql: sql, bindings: [volumeUUID, Int64(bitPattern: fileID)])
+            try database.execute(sql: sql, bindings: [volumeUUID, Int64(bitPattern: fileID)])
         }
     }
 
@@ -647,7 +681,7 @@ public actor FileIndexer {
         }
     }
 
-    private func scanVolumeRecursively(volumeUUID: String, rootsOnThisVolume: [URL]) {
+    private func scanVolumeRecursively(volumeUUID: String, rootsOnThisVolume: [URL]) throws {
         for rootToScan in rootsOnThisVolume {
             guard let enumerator = FileManager.default.enumerator(
                 at: rootToScan,
@@ -703,7 +737,7 @@ public actor FileIndexer {
                 ])
                 
                 if batch.count >= 10000 {
-                    try? database.executeBatch(
+                    try database.executeBatch(
                         sql: "INSERT OR REPLACE INTO fs_nodes (volume_uuid, file_id, parent_id, name, name_character_mask, is_directory, file_extension, size, modification_date, uti) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?);",
                         items: batch
                     )
@@ -712,7 +746,7 @@ public actor FileIndexer {
             }
             
             if !batch.isEmpty {
-                try? database.executeBatch(
+                try database.executeBatch(
                     sql: "INSERT OR REPLACE INTO fs_nodes (volume_uuid, file_id, parent_id, name, name_character_mask, is_directory, file_extension, size, modification_date, uti) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?);",
                     items: batch
                 )

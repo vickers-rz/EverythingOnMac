@@ -18,36 +18,54 @@ final class SearchViewModel: ObservableObject {
     @Published var sortField: SortField = .relevance
     @Published var sortDirection: SortDirection = .descending
 
-    private let coordinator: SearchCoordinator
+    private var coordinator: SearchCoordinator?
     private var searchTask: Task<Void, Never>?
     private var eventMonitor: FileSystemEventMonitor?
 
     init(roots: [URL] = [URL(fileURLWithPath: NSHomeDirectory())]) {
         let excluded = ["/System", "/private/var", "/Library/Caches"]
+        volumeCapabilities = APFSVolumeInspector.inspect(roots: roots)
+
         do {
-            let indexer = try FileIndexer(configuration: IndexerConfiguration(roots: roots, excludedPaths: excluded))
+            let indexer = try FileIndexer(
+                configuration: IndexerConfiguration(roots: roots, excludedPaths: excluded)
+            )
             let ripgrep = RipgrepSearcher(configuration: RipgrepConfiguration())
-            self.coordinator = SearchCoordinator(indexer: indexer, ripgrepSearcher: ripgrep, roots: roots)
-            self.volumeCapabilities = coordinator.inspectVolumes()
-            self.eventMonitor = FileSystemEventMonitor(roots: roots) { [coordinator] changes, eventID in
-                Task { await coordinator.apply(changes: changes, eventID: eventID) }
-            }
-            
-            Task {
-                let lastEvent = await coordinator.lastEventID()
-                if let lastEvent {
-                    self.eventMonitor?.start(sinceEventId: lastEvent)
-                } else {
-                    self.eventMonitor?.start()
+            let coordinator = SearchCoordinator(indexer: indexer, ripgrepSearcher: ripgrep, roots: roots)
+            self.coordinator = coordinator
+
+            self.eventMonitor = FileSystemEventMonitor(roots: roots) { [weak self, coordinator] changes, eventID in
+                Task { @MainActor [weak self] in
+                    do {
+                        try await coordinator.apply(changes: changes, eventID: eventID)
+                    } catch {
+                        self?.lastError = "文件索引增量更新失败：\(error.localizedDescription)"
+                    }
                 }
-                await setupIndex()
+            }
+
+            Task { @MainActor [weak self] in
+                guard let self else { return }
+                do {
+                    let lastEvent = await coordinator.lastEventID()
+                    if let lastEvent {
+                        try self.eventMonitor?.start(sinceEventId: lastEvent)
+                    } else {
+                        try self.eventMonitor?.start()
+                    }
+                } catch {
+                    self.lastError = error.localizedDescription
+                }
+                await self.setupIndex()
             }
         } catch {
-            fatalError("Failed to initialize FileIndexer: \(error)")
+            coordinator = nil
+            lastError = "索引服务初始化失败：\(error.localizedDescription)"
         }
     }
 
     func setupIndex() async {
+        guard let coordinator else { return }
         let count = await coordinator.indexedItemCount()
         if count > 0 {
             indexedCount = count
@@ -57,14 +75,27 @@ final class SearchViewModel: ObservableObject {
     }
 
     func rebuildIndex() async {
+        guard let coordinator else { return }
         isIndexing = true
-        await coordinator.rebuildIndex()
-        indexedCount = await coordinator.indexedItemCount()
-        isIndexing = false
+        defer { isIndexing = false }
+
+        do {
+            try await coordinator.rebuildIndex()
+            indexedCount = await coordinator.indexedItemCount()
+            lastError = nil
+        } catch {
+            lastError = "索引重建失败：\(error.localizedDescription)"
+        }
     }
 
     func onQueryChanged() {
         searchTask?.cancel()
+        guard let coordinator else {
+            results = []
+            isTruncated = false
+            return
+        }
+
         searchTask = Task {
             try? await Task.sleep(for: .milliseconds(160))
             if Task.isCancelled { return }
@@ -77,9 +108,9 @@ final class SearchViewModel: ObservableObject {
             let responses = await coordinator.searchStream(query: query)
             for await response in responses {
                 if Task.isCancelled { return }
-                self.results = response.results
-                self.isTruncated = response.isTruncated
-                self.lastError = response.indexError?.localizedDescription
+                results = response.results
+                isTruncated = response.isTruncated
+                lastError = response.indexError?.localizedDescription
                     ?? response.contentError?.localizedDescription
             }
         }

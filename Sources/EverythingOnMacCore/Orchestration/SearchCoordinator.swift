@@ -24,12 +24,15 @@ public actor SearchCoordinator {
         self.streamFlushInterval = streamFlushInterval
     }
 
-    public func rebuildIndex() async { await indexer.rebuild() }
+    public func rebuildIndex() async throws { try await indexer.rebuild() }
 
-    public func apply(changes: [FileSystemChange], eventID: UInt64) async {
+    public func apply(changes: [FileSystemChange], eventID: UInt64) async throws {
         for change in changes {
-            if change.isRemoval { await indexer.remove(path: change.path) }
-            else { await indexer.upsert(path: change.path) }
+            if change.isRemoval {
+                try await indexer.remove(path: change.path)
+            } else {
+                try await indexer.upsert(path: change.path)
+            }
         }
         await indexer.setLastEventID(eventID)
     }

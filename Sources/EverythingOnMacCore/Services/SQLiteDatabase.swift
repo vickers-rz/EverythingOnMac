@@ -253,7 +253,10 @@ public final class SQLiteDatabase: @unchecked Sendable {
     }
 
     public func executeBatch(sql: String, items: [[Any]]) throws {
-        try execute(sql: "BEGIN TRANSACTION;")
+        guard !items.isEmpty else { return }
+
+        let savepoint = "everything_batch"
+        try execute(sql: "SAVEPOINT \(savepoint);")
         do {
             var statement: OpaquePointer?
             if sqlite3_prepare_v2(db, sql, -1, &statement, nil) != SQLITE_OK {
@@ -261,17 +264,23 @@ public final class SQLiteDatabase: @unchecked Sendable {
             }
             defer { sqlite3_finalize(statement) }
 
+            let expectedBindingCount = Int(sqlite3_bind_parameter_count(statement))
             for bindings in items {
+                guard bindings.count == expectedBindingCount else {
+                    throw SQLiteError.bindFailed("Expected \(expectedBindingCount) bindings, received \(bindings.count)")
+                }
                 sqlite3_reset(statement)
+                sqlite3_clear_bindings(statement)
                 try bind(statement: statement, bindings: bindings)
                 let stepResult = sqlite3_step(statement)
                 if stepResult != SQLITE_DONE && stepResult != SQLITE_ROW {
                     throw SQLiteError.stepFailed(errmsg())
                 }
             }
-            try execute(sql: "COMMIT;")
+            try execute(sql: "RELEASE SAVEPOINT \(savepoint);")
         } catch {
-            try? execute(sql: "ROLLBACK;")
+            try? execute(sql: "ROLLBACK TO SAVEPOINT \(savepoint);")
+            try? execute(sql: "RELEASE SAVEPOINT \(savepoint);")
             throw error
         }
     }
@@ -288,7 +297,15 @@ public final class SQLiteDatabase: @unchecked Sendable {
         var results: [[String: Any]] = []
         let columnCount = sqlite3_column_count(statement)
 
-        while sqlite3_step(statement) == SQLITE_ROW {
+        while true {
+            let stepResult = sqlite3_step(statement)
+            if stepResult == SQLITE_DONE {
+                return results
+            }
+            guard stepResult == SQLITE_ROW else {
+                throw SQLiteError.stepFailed(errmsg())
+            }
+
             var row: [String: Any] = [:]
             for i in 0..<columnCount {
                 let name = String(cString: sqlite3_column_name(statement, i))
@@ -304,7 +321,6 @@ public final class SQLiteDatabase: @unchecked Sendable {
                 case SQLITE_NULL:
                     row[name] = NSNull()
                 default:
-                    // Fallback to text if unknown
                     if let text = sqlite3_column_text(statement, i) {
                         row[name] = String(cString: text)
                     } else {
@@ -314,8 +330,6 @@ public final class SQLiteDatabase: @unchecked Sendable {
             }
             results.append(row)
         }
-
-        return results
     }
 
     private func bind(statement: OpaquePointer?, bindings: [Any]) throws {

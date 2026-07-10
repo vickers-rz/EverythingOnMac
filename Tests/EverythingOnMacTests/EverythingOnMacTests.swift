@@ -113,9 +113,9 @@ func fileIndexerSearchFeatures() async throws {
     let indexer = try FileIndexer(configuration: config)
 
     // Manually add some test files to indexer DB via upsert
-    await indexer.upsert(path: file1)
-    await indexer.upsert(path: file2)
-    await indexer.upsert(path: file3)
+    try await indexer.upsert(path: file1)
+    try await indexer.upsert(path: file2)
+    try await indexer.upsert(path: file3)
 
     // Test basic query
     let query1 = QueryParser.parse("report")
@@ -175,8 +175,8 @@ func fileIndexerSortingAndPaging() async throws {
     let config = IndexerConfiguration(roots: [URL(fileURLWithPath: tempDir)], databasePath: dbPath)
     let indexer = try FileIndexer(configuration: config)
 
-    await indexer.upsert(path: file1)
-    await indexer.upsert(path: file2)
+    try await indexer.upsert(path: file1)
+    try await indexer.upsert(path: file2)
 
     // Test sort by size ascending
     var query = QueryParser.parse("ext:txt")
@@ -296,10 +296,10 @@ func pathPrefixCTEFilteringRestrictsBeforeLimit() async throws {
 
     // Upsert all files.
     for i in 1...5 {
-        await indexer.upsert(path: tempDir + String(format: "match_%02d.txt", i))
+        try await indexer.upsert(path: tempDir + String(format: "match_%02d.txt", i))
     }
-    await indexer.upsert(path: subDir)
-    await indexer.upsert(path: subDir + "match_target.txt")
+    try await indexer.upsert(path: subDir)
+    try await indexer.upsert(path: subDir + "match_target.txt")
 
     // Query with pathPrefix = subDir and LIMIT = 1. All files match the term,
     // so the CTE must restrict the candidate set before LIMIT is applied.
@@ -335,7 +335,7 @@ func rebuildPrunesExcludedPaths() async throws {
     let indexer = try FileIndexer(configuration: config)
 
     // Trigger rebuilding (which scans the volume/root and prunes)
-    await indexer.rebuild()
+    try await indexer.rebuild()
 
     // Query all results
     let results = try await indexer.query(QueryParser.parse(""))
@@ -360,7 +360,7 @@ func unresolvablePathPrefixReturnsEmpty() async throws {
         roots: [URL(fileURLWithPath: tempDir)],
         databasePath: tempDir + "invalid_prefix.db"
     ))
-    await indexer.upsert(path: filePath)
+    try await indexer.upsert(path: filePath)
 
     let missingPath = tempDir + "does-not-exist/"
     let query = QueryParser.parse("visible path:\(missingPath)")
@@ -545,7 +545,7 @@ func searchCoordinatorIncrementallyMergesIndexedFile() async throws {
         roots: [URL(fileURLWithPath: tempDir)],
         databasePath: tempDir + "incremental_merge.db"
     ))
-    await indexer.upsert(path: filePath)
+    try await indexer.upsert(path: filePath)
 
     let coordinator = SearchCoordinator(
         indexer: indexer,
@@ -771,7 +771,7 @@ func caseSensitiveFuzzyMaskIsSafe() async throws {
     let path = dir + "ABC.txt"
     try "x".write(toFile: path, atomically: true, encoding: .utf8)
     let indexer = try FileIndexer(configuration: IndexerConfiguration(roots: [URL(fileURLWithPath: dir)], databasePath: dir + "case.db"))
-    await indexer.upsert(path: path)
+    try await indexer.upsert(path: path)
     let query = SearchQuery(raw: "ABC", terms: ["ABC"], isCaseSensitive: true, mode: .filenameOnly, filenameMatchMode: .fuzzy, limit: 10)
     let results = try await indexer.query(query)
     #expect(results.map(\.metadata.filename).contains("ABC.txt"))
@@ -785,7 +785,7 @@ func multiTokenFuzzySearch() async throws {
     let path = dir + "ApplicationCache.txt"
     try "x".write(toFile: path, atomically: true, encoding: .utf8)
     let indexer = try FileIndexer(configuration: IndexerConfiguration(roots: [URL(fileURLWithPath: dir)], databasePath: dir + "tokens.db"))
-    await indexer.upsert(path: path)
+    try await indexer.upsert(path: path)
     let query = SearchQuery(raw: "app cache", terms: ["app", "cache"], mode: .filenameOnly, filenameMatchMode: .fuzzy, limit: 10)
     let results = try await indexer.query(query)
     #expect(results.count == 1)
@@ -799,7 +799,7 @@ func coordinatorPreservesPaging() async throws {
     defer { try? FileManager.default.removeItem(atPath: dir) }
     for name in ["report.txt", "report-old.txt", "my-report.txt"] { try "x".write(toFile: dir + name, atomically: true, encoding: .utf8) }
     let indexer = try FileIndexer(configuration: IndexerConfiguration(roots: [URL(fileURLWithPath: dir)], databasePath: dir + "paging.db"))
-    for name in ["report.txt", "report-old.txt", "my-report.txt"] { await indexer.upsert(path: dir + name) }
+    for name in ["report.txt", "report-old.txt", "my-report.txt"] { try await indexer.upsert(path: dir + name) }
     let coordinator = SearchCoordinator(indexer: indexer, ripgrepSearcher: RipgrepSearcher(configuration: RipgrepConfiguration(executablePath: "/missing/rg")), roots: [URL(fileURLWithPath: dir)])
     var query = SearchQuery(raw: "report", terms: ["report"], mode: .filenameOnly, filenameMatchMode: .fuzzy, limit: 1, offset: 1)
     query.sortOption = SortOption(field: .relevance, direction: .descending)
