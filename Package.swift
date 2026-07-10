@@ -5,7 +5,7 @@ let package = Package(
     name: "EverythingOnMac",
     products: [
         .executable(name: "EverythingOnMac", targets: ["EverythingOnMac"]),
-        .library(name: "EverythingOnMacCore", targets: ["EverythingOnMacCore"])
+        .library(name: "EverythingOnMacCore", targets: ["EverythingOnMacCore"]),
     ],
     targets: [
         .target(
@@ -17,8 +17,8 @@ let package = Package(
         ),
         .testTarget(
             name: "EverythingOnMacTests",
-            dependencies: ["EverythingOnMacCore"]
-        )
+            dependencies: ["EverythingOnMacCore", "EverythingOnMac"]
+        ),
     ],
     swiftLanguageModes: [.v6]
 )
