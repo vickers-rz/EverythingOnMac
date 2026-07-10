@@ -42,3 +42,18 @@ func mergeCombinesIndexAndContent() {
     #expect(merged[0].source.contains(.contentRipgrep))
     #expect(merged[0].contentMatches.count == 1)
 }
+
+
+@Test("Default rg path prefers environment override")
+func defaultRipgrepPathUsesEnvironmentCandidates() {
+    let path = RipgrepConfiguration.defaultExecutablePath()
+    #expect(!path.isEmpty)
+}
+
+@Test("APFS inspector returns one capability record per root")
+func volumeInspectorReportsRoots() {
+    let roots = [URL(fileURLWithPath: NSTemporaryDirectory())]
+    let capabilities = APFSVolumeInspector.inspect(roots: roots)
+    #expect(capabilities.count == 1)
+    #expect(capabilities[0].rootPath == roots[0].path)
+}

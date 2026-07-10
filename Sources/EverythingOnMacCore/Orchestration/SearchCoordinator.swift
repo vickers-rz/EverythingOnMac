@@ -15,6 +15,24 @@ public actor SearchCoordinator {
         await indexer.rebuild()
     }
 
+    public func apply(changes: [FileSystemChange]) async {
+        for change in changes {
+            if change.isRemoval {
+                await indexer.remove(path: change.path)
+            } else {
+                await indexer.upsert(path: change.path)
+            }
+        }
+    }
+
+    public func indexedItemCount() async -> Int {
+        await indexer.itemCount()
+    }
+
+    public nonisolated func inspectVolumes() -> [VolumeCapabilities] {
+        APFSVolumeInspector.inspect(roots: roots)
+    }
+
     public func search(query: SearchQuery) async -> [SearchResult] {
         async let indexResults: [SearchResult] = {
             guard query.mode != .contentOnly else { return [] }

@@ -4,9 +4,19 @@ public struct RipgrepConfiguration: Sendable {
     public var executablePath: String
     public var timeoutSeconds: TimeInterval
 
-    public init(executablePath: String = "/usr/bin/rg", timeoutSeconds: TimeInterval = 8) {
+    public init(executablePath: String = RipgrepConfiguration.defaultExecutablePath(), timeoutSeconds: TimeInterval = 8) {
         self.executablePath = executablePath
         self.timeoutSeconds = timeoutSeconds
+    }
+
+    public static func defaultExecutablePath() -> String {
+        let candidates = [
+            ProcessInfo.processInfo.environment["RG_PATH"],
+            "/opt/homebrew/bin/rg",
+            "/usr/local/bin/rg",
+            "/usr/bin/rg"
+        ].compactMap { $0 }
+        return candidates.first { FileManager.default.isExecutableFile(atPath: $0) } ?? "rg"
     }
 }
 
