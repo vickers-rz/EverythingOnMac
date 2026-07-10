@@ -1,19 +1,23 @@
 // swift-tools-version: 6.3
-// The swift-tools-version declares the minimum version of Swift required to build this package.
-
 import PackageDescription
 
 let package = Package(
     name: "EverythingOnMac",
+    products: [
+        .executable(name: "EverythingOnMac", targets: ["EverythingOnMac"]),
+        .library(name: "EverythingOnMacCore", targets: ["EverythingOnMacCore"]),
+    ],
     targets: [
-        // Targets are the basic building blocks of a package, defining a module or a test suite.
-        // Targets can depend on other targets in this package and products from dependencies.
+        .target(
+            name: "EverythingOnMacCore"
+        ),
         .executableTarget(
-            name: "EverythingOnMac"
+            name: "EverythingOnMac",
+            dependencies: ["EverythingOnMacCore"]
         ),
         .testTarget(
             name: "EverythingOnMacTests",
-            dependencies: ["EverythingOnMac"]
+            dependencies: ["EverythingOnMacCore", "EverythingOnMac"]
         ),
     ],
     swiftLanguageModes: [.v6]

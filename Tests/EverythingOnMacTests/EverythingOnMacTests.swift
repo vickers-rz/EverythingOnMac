@@ -1,59 +1,44 @@
 import Foundation
 import Testing
-@testable import EverythingOnMac
+@testable import EverythingOnMacCore
 
-@Test func fileIndexerFiltersByName() throws {
-    let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
-    try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
-    defer { try? FileManager.default.removeItem(at: root) }
+@Test("Parser supports filters and flags")
+func parserSupportsStructuredTokens() {
+    let query = QueryParser.parse("\"hello world\" ext:md ext:txt path:/Users/me -draft regex:true case:true", mode: .mixed)
 
-    let target = root.appendingPathComponent("target-notes.txt")
-    let other = root.appendingPathComponent("image.png")
-    try "hello".write(to: target, atomically: true, encoding: .utf8)
-    try "binary".write(to: other, atomically: true, encoding: .utf8)
-
-    let results = try FileIndexer().indexFiles(at: root, fileNameQuery: "notes", maxResults: 10, includeHidden: false)
-
-    #expect(results.count == 1)
-    #expect(results.first?.name == "target-notes.txt")
-    #expect(results.first?.path.hasSuffix("target-notes.txt") == true)
+    #expect(query.terms == ["hello world"])
+    #expect(query.excludedTerms == ["draft"])
+    #expect(query.pathPrefix == "/Users/me")
+    #expect(query.fileExtensions == Set(["md", "txt"]))
+    #expect(query.isRegex)
+    #expect(query.isCaseSensitive)
 }
 
-@Test func ripgrepParserExtractsMatches() {
-    let output = """
-{"type":"begin","data":{"path":{"text":"/tmp/a.txt"}}}
-{"type":"match","data":{"path":{"text":"/tmp/a.txt"},"lines":{"text":"Hello Mac\\n"},"line_number":3,"absolute_offset":10,"submatches":[]}}
-{"type":"end","data":{"path":{"text":"/tmp/a.txt"},"binary_offset":null,"stats":{"elapsed":{"secs":0,"nanos":1,"human":"0.000001s"},"searches":1,"searches_with_match":1,"bytes_searched":9,"bytes_printed":0,"matched_lines":1,"matches":1}}}
-"""
+@Test("Merge unions source and content matches")
+func mergeCombinesIndexAndContent() {
+    let metadata = FileMetadata(
+        path: "/tmp/a.txt",
+        filename: "a.txt",
+        fileExtension: "txt",
+        size: 1,
+        modificationDate: nil,
+        fileID: 1,
+        uti: nil
+    )
 
-    let matches = RipgrepSearcher.parseMatches(from: output)
+    let fromIndex = SearchResult(metadata: metadata, source: [.filenameIndex])
+    let fromContent = SearchResult(metadata: metadata, source: [.contentRipgrep], contentMatches: [ContentMatch(line: 5, column: 1, text: "abc")])
 
-    #expect(matches.count == 1)
-    #expect(matches[0] == ContentMatch(filePath: "/tmp/a.txt", lineNumber: 3, lineText: "Hello Mac"))
-}
+    let coordinator = SearchCoordinator(
+        indexer: FileIndexer(configuration: IndexerConfiguration(roots: [])),
+        ripgrepSearcher: RipgrepSearcher(),
+        roots: []
+    )
 
-@Test func searchEngineIntersectsNameAndContent() throws {
-    struct StubIndexer: FileIndexing {
-        func indexFiles(at root: URL, fileNameQuery: String?, maxResults: Int, includeHidden: Bool) throws -> [IndexedFile] {
-            [
-                IndexedFile(path: "/tmp/a.txt", name: "a.txt", size: 1, modifiedAt: nil, fileID: nil, volumeFormatDescription: "apfs"),
-                IndexedFile(path: "/tmp/b.txt", name: "b.txt", size: 1, modifiedAt: nil, fileID: nil, volumeFormatDescription: "apfs"),
-            ]
-        }
-    }
+    let merged = coordinator.merge(index: [fromIndex], content: [fromContent])
 
-    struct StubContentSearcher: ContentSearching {
-        func searchContent(query: String, root: URL) throws -> [ContentMatch] {
-            [ContentMatch(filePath: "/tmp/b.txt", lineNumber: 8, lineText: "hit")]
-        }
-    }
-
-    let engine = SearchEngine(indexer: StubIndexer(), contentSearcher: StubContentSearcher())
-    let options = SearchOptions(root: URL(fileURLWithPath: "/tmp"), fileNameQuery: nil, contentQuery: "hit", includeHidden: false, maxResults: 100)
-
-    let results = try engine.search(options: options)
-
-    #expect(results.count == 1)
-    #expect(results[0].file.path == "/tmp/b.txt")
-    #expect(results[0].contentMatches.count == 1)
+    #expect(merged.count == 1)
+    #expect(merged[0].source.contains(.filenameIndex))
+    #expect(merged[0].source.contains(.contentRipgrep))
+    #expect(merged[0].contentMatches.count == 1)
 }
