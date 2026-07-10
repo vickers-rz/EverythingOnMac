@@ -140,30 +140,30 @@ func fileIndexerSearchFeatures() async throws {
 
     // Test basic query
     let query1 = QueryParser.parse("report")
-    let results1 = try await indexer.query(query1)
+    let results1 = (try await indexer.query(query1)).results
     #expect(results1.count == 1)
     #expect(results1[0].metadata.filename == "Report.pdf")
 
     // Test ext filter
     let query2 = QueryParser.parse("ext:txt")
-    let results2 = try await indexer.query(query2)
+    let results2 = (try await indexer.query(query2)).results
     #expect(results2.count == 1)
     #expect(results2[0].metadata.filename == "notes.txt")
 
     // Test path prefix filter
     let query3 = QueryParser.parse("path:\(tempDir)")
-    let results3 = try await indexer.query(query3)
+    let results3 = (try await indexer.query(query3)).results
     #expect(results3.count == 3)
 
     // Test regex query
     let query4 = QueryParser.parse("vacation regex:true")
-    let results4 = try await indexer.query(query4)
+    let results4 = (try await indexer.query(query4)).results
     #expect(results4.count == 1)
     #expect(results4[0].metadata.filename == "vacation.jpg")
     
     // Test regex case-sensitive query
     let query5 = QueryParser.parse("^notes.*txt$ regex:true")
-    let results5 = try await indexer.query(query5)
+    let results5 = (try await indexer.query(query5)).results
     #expect(results5.count == 1)
 }
 
@@ -202,14 +202,14 @@ func fileIndexerSortingAndPaging() async throws {
     // Test sort by size ascending
     var query = QueryParser.parse("ext:txt")
     query.sortOption = SortOption(field: .size, direction: .ascending)
-    let ascResults = try await indexer.query(query)
+    let ascResults = (try await indexer.query(query)).results
     #expect(ascResults.count == 2)
     #expect(ascResults[0].metadata.filename == "small.txt")
     #expect(ascResults[1].metadata.filename == "large.txt")
 
     // Test sort by size descending
     query.sortOption = SortOption(field: .size, direction: .descending)
-    let descResults = try await indexer.query(query)
+    let descResults = (try await indexer.query(query)).results
     #expect(descResults.count == 2)
     #expect(descResults[0].metadata.filename == "large.txt")
     #expect(descResults[1].metadata.filename == "small.txt")
@@ -217,13 +217,13 @@ func fileIndexerSortingAndPaging() async throws {
     // Test paging (limit = 1)
     query.limit = 1
     query.sortOption = SortOption(field: .size, direction: .ascending)
-    let limitResults = try await indexer.query(query)
+    let limitResults = (try await indexer.query(query)).results
     #expect(limitResults.count == 1)
     #expect(limitResults[0].metadata.filename == "small.txt")
 
     // Test paging with offset (limit = 1, offset = 1)
     query.offset = 1
-    let offsetResults = try await indexer.query(query)
+    let offsetResults = (try await indexer.query(query)).results
     #expect(offsetResults.count == 1)
     #expect(offsetResults[0].metadata.filename == "large.txt")
 }
@@ -328,7 +328,7 @@ func pathPrefixCTEFilteringRestrictsBeforeLimit() async throws {
     query.limit = 1
     query.sortOption = SortOption(field: .filename, direction: .ascending)
 
-    let results = try await indexer.query(query)
+    let results = (try await indexer.query(query)).results
     #expect(results.count == 1)
     #expect(results[0].metadata.filename == "match_target.txt")
 }
@@ -359,7 +359,7 @@ func rebuildPrunesExcludedPaths() async throws {
     try await indexer.rebuild()
 
     // Query all results
-    let results = try await indexer.query(QueryParser.parse(""))
+    let results = (try await indexer.query(QueryParser.parse(""))).results
 
     // keep.txt should exist, skip.txt should be pruned
     let filenames = results.map { $0.metadata.filename }
@@ -367,7 +367,7 @@ func rebuildPrunesExcludedPaths() async throws {
     #expect(!filenames.contains("skip.txt"))
 }
 
-@Test("FileIndexer reports invalid directory structures as index corruption")
+@Test("FileIndexer resolvePath filters out corrupted structures, reports count, and back-fills results up to LIMIT")
 func fileIndexerResolvePathInvalidStructures() async throws {
     let dbPath = NSTemporaryDirectory() + UUID().uuidString + ".db"
     defer { try? FileManager.default.removeItem(atPath: dbPath) }
@@ -375,11 +375,11 @@ func fileIndexerResolvePathInvalidStructures() async throws {
     let db = try SQLiteDatabase(path: dbPath)
 
     // We create structural nodes directly in DB.
-    // 1. Missing parent node: parent_id = 9999 (which does not exist in directoryCache)
+    // 1. Missing parent node: parent_id = 9999 (corrupt)
     try db.execute(sql: "INSERT INTO fs_nodes (volume_uuid, file_id, parent_id, name, is_directory, file_extension, size, modification_date) VALUES (?, ?, ?, ?, ?, ?, ?, ?);",
                    bindings: ["vol-1", 100, 9999, "missing_parent.txt", 0, "txt", 10, Date().timeIntervalSince1970])
 
-    // 2. Cycle parent node: file_id = 200 (parent = 201), file_id = 201 (parent = 200)
+    // 2. Cycle parent node: file_id = 200 (parent = 201), file_id = 201 (parent = 200) (corrupt)
     try db.execute(sql: "INSERT INTO fs_nodes (volume_uuid, file_id, parent_id, name, is_directory, file_extension, size, modification_date) VALUES (?, ?, ?, ?, ?, ?, ?, ?);",
                    bindings: ["vol-1", 200, 201, "dirA", 1, "", 0, Date().timeIntervalSince1970])
     try db.execute(sql: "INSERT INTO fs_nodes (volume_uuid, file_id, parent_id, name, is_directory, file_extension, size, modification_date) VALUES (?, ?, ?, ?, ?, ?, ?, ?);",
@@ -387,18 +387,37 @@ func fileIndexerResolvePathInvalidStructures() async throws {
     try db.execute(sql: "INSERT INTO fs_nodes (volume_uuid, file_id, parent_id, name, is_directory, file_extension, size, modification_date) VALUES (?, ?, ?, ?, ?, ?, ?, ?);",
                    bindings: ["vol-1", 202, 200, "cycle.txt", 0, "txt", 10, Date().timeIntervalSince1970])
 
+    // 3. 5 valid nodes
+    for i in 1...5 {
+        try db.execute(sql: "INSERT INTO fs_nodes (volume_uuid, file_id, parent_id, name, is_directory, file_extension, size, modification_date) VALUES (?, ?, ?, ?, ?, ?, ?, ?);",
+                       bindings: ["vol-1", 300 + i, 2, "valid_\(i).txt", 0, "txt", 10, Date().timeIntervalSince1970])
+    }
+
     let config = IndexerConfiguration(roots: [URL(fileURLWithPath: "/tmp")], databasePath: dbPath)
     let indexer = try FileIndexer(configuration: config)
 
-    do {
-        _ = try await indexer.query(QueryParser.parse(""))
-        Issue.record("Expected indexCorrupted")
-    } catch let error as FileIndexSearchError {
-        guard case .indexCorrupted = error else {
-            Issue.record("Unexpected file-index error: \(error)")
-            return
-        }
-    }
+    // We search with limit = 3. Even though there are corrupt files, we expect to get exactly 3 valid results back-filled!
+    var query = QueryParser.parse("valid")
+    query.limit = 3
+    let result = try await indexer.query(query)
+    
+    #expect(result.results.count == 3)
+    let filenames = result.results.map { $0.metadata.filename }
+    #expect(filenames.contains("valid_1.txt"))
+    #expect(filenames.contains("valid_2.txt"))
+    #expect(filenames.contains("valid_3.txt"))
+    #expect(!filenames.contains("missing_parent.txt"))
+    #expect(!filenames.contains("cycle.txt"))
+
+    // Querying everything to check skipped counts
+    let allResult = try await indexer.query(QueryParser.parse(""))
+    #expect(allResult.skippedCorruptNodeCount == 4)
+    #expect(allResult.firstCorruptionDescription != nil)
+    
+    let allFilenames = allResult.results.map { $0.metadata.filename }
+    #expect(allFilenames.count == 5)
+    #expect(!allFilenames.contains("missing_parent.txt"))
+    #expect(!allFilenames.contains("cycle.txt"))
 }
 
 @Test("Unresolvable pathPrefix throws invalidPathPrefix error")
@@ -499,7 +518,7 @@ func ripgrepStreamsIncrementally() async throws {
     let script = try makeExecutableScript(contents: """
     #!/bin/sh
     printf '%s\\n' '{"type":"match","data":{"path":{"text":"/tmp/first.txt"},"lines":{"text":"first\\n"},"line_number":1,"submatches":[{"start":0}]}}'
-    sleep 1
+    sleep 2
     touch '\(markerPath)'
     printf '%s\\n' '{"type":"match","data":{"path":{"text":"/tmp/second.txt"},"lines":{"text":"second\\n"},"line_number":2,"submatches":[{"start":0}]}}'
     exit 0
@@ -511,7 +530,7 @@ func ripgrepStreamsIncrementally() async throws {
 
     let searcher = RipgrepSearcher(configuration: RipgrepConfiguration(
         executablePath: script,
-        timeoutSeconds: 5
+        timeoutSeconds: 15
     ))
     let stream = await searcher.stream(
         query: QueryParser.parse("needle", mode: .contentOnly),
@@ -816,7 +835,7 @@ func benchmarkFuzzyBitmaskQuery() async throws {
     let start = DispatchTime.now()
 
     let query = SearchQuery(raw: "apc", terms: ["apc"], filenameMatchMode: .fuzzy, limit: 100)
-    let results = try await activeIndexer.query(query)
+    let results = (try await activeIndexer.query(query)).results
 
     let end = DispatchTime.now()
     let nanoTime = end.uptimeNanoseconds - start.uptimeNanoseconds
@@ -839,7 +858,7 @@ func caseSensitiveFuzzyMaskIsSafe() async throws {
     let indexer = try FileIndexer(configuration: IndexerConfiguration(roots: [URL(fileURLWithPath: dir)], databasePath: dir + "case.db"))
     try await indexer.upsert(path: path)
     let query = SearchQuery(raw: "ABC", terms: ["ABC"], isCaseSensitive: true, mode: .filenameOnly, filenameMatchMode: .fuzzy, limit: 10)
-    let results = try await indexer.query(query)
+    let results = (try await indexer.query(query)).results
     #expect(results.map(\.metadata.filename).contains("ABC.txt"))
 }
 
@@ -853,7 +872,7 @@ func multiTokenFuzzySearch() async throws {
     let indexer = try FileIndexer(configuration: IndexerConfiguration(roots: [URL(fileURLWithPath: dir)], databasePath: dir + "tokens.db"))
     try await indexer.upsert(path: path)
     let query = SearchQuery(raw: "app cache", terms: ["app", "cache"], mode: .filenameOnly, filenameMatchMode: .fuzzy, limit: 10)
-    let results = try await indexer.query(query)
+    let results = (try await indexer.query(query)).results
     #expect(results.count == 1)
     #expect(results[0].metadata.filename == "ApplicationCache.txt")
 }

@@ -164,19 +164,25 @@ public struct SearchResponse: Sendable, Equatable {
     public var contentError: RipgrepSearchError?
     public var isTruncated: Bool
     public var totalCandidateCount: Int?
+    public var skippedCorruptNodeCount: Int
+    public var firstCorruptionDescription: String?
 
     public init(
         results: [SearchResult],
         indexError: FileIndexSearchError? = nil,
         contentError: RipgrepSearchError?,
         isTruncated: Bool = false,
-        totalCandidateCount: Int? = nil
+        totalCandidateCount: Int? = nil,
+        skippedCorruptNodeCount: Int = 0,
+        firstCorruptionDescription: String? = nil
     ) {
         self.results = results
         self.indexError = indexError
         self.contentError = contentError
         self.isTruncated = isTruncated
         self.totalCandidateCount = totalCandidateCount
+        self.skippedCorruptNodeCount = skippedCorruptNodeCount
+        self.firstCorruptionDescription = firstCorruptionDescription
     }
 }
 

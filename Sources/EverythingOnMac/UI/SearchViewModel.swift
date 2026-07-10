@@ -75,6 +75,7 @@ final class SearchViewModel: ObservableObject {
     @Published var volumeCapabilities: [VolumeCapabilities] = []
     @Published var isIndexing = false
     @Published var lastError: PresentedError?
+    @Published var integrityWarning: String? = nil
     @Published var isTruncated = false
     @Published var sortField: SortField = .relevance
     @Published var sortDirection: SortDirection = .descending
@@ -321,6 +322,11 @@ final class SearchViewModel: ObservableObject {
                     guard self.serviceGeneration == generation else { return }
                     self.results = response.results
                     self.isTruncated = response.isTruncated
+                    if response.skippedCorruptNodeCount > 0 {
+                        self.integrityWarning = "索引中发现 \(response.skippedCorruptNodeCount) 条无法恢复路径的记录，结果可能不完整。建议重建索引。"
+                    } else {
+                        self.integrityWarning = nil
+                    }
                     if let indexError = response.indexError {
                         switch indexError {
                         case .databaseError, .indexCorrupted:

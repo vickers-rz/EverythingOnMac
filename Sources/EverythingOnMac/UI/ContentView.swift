@@ -101,6 +101,30 @@ struct ContentView: View {
                 }
             }
 
+            if let integrityWarning = viewModel.integrityWarning {
+                VStack(alignment: .leading, spacing: 8) {
+                    Text(integrityWarning)
+                        .font(.caption)
+                        .foregroundStyle(.orange)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                        .textSelection(.enabled)
+                    
+                    HStack(spacing: 12) {
+                        Button("重建数据库") {
+                            viewModel.deleteDatabaseAndRetry()
+                        }
+                        Button("打开数据库目录") {
+                            viewModel.openDatabaseDirectory()
+                        }
+                    }
+                    .buttonStyle(.bordered)
+                    .controlSize(.small)
+                }
+                .padding(8)
+                .background(Color.orange.opacity(0.1))
+                .cornerRadius(4)
+            }
+
             List(viewModel.results, id: \.metadata.path) { result in
                 VStack(alignment: .leading, spacing: 4) {
                     Text(result.metadata.filename)

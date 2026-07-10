@@ -1,5 +1,6 @@
 import Foundation
 import CSearchFS
+import os
 
 public struct IndexerConfiguration: Sendable {
     public var roots: [URL]
@@ -62,9 +63,23 @@ public enum FileIndexSearchError: Error, Sendable, Equatable, LocalizedError {
     }
 }
 
+public struct FileIndexQueryResult: Sendable, Equatable {
+    public let results: [SearchResult]
+    public let skippedCorruptNodeCount: Int
+    public let firstCorruptionDescription: String?
+
+    public init(results: [SearchResult], skippedCorruptNodeCount: Int, firstCorruptionDescription: String?) {
+        self.results = results
+        self.skippedCorruptNodeCount = skippedCorruptNodeCount
+        self.firstCorruptionDescription = firstCorruptionDescription
+    }
+}
+
 public actor FileIndexer {
     private let configuration: IndexerConfiguration
     private let database: SQLiteDatabase
+    private let logger = Logger(subsystem: "com.everythingonmac", category: "FileIndexer")
+    private var isCacheLoaded = false
     
     // Cache for directory nodes: [volume_uuid: [file_id: (parent_id, name)]]
     private var directoryCache: [String: [UInt64: (parentID: UInt64, name: String)]] = [:]
@@ -90,8 +105,9 @@ public actor FileIndexer {
         return appSupport.appendingPathComponent("EverythingOnMac/everything.db").path
     }
 
-    private func ensureCacheLoaded() async {
-        guard directoryCache.isEmpty else { return }
+    private func ensureCacheLoaded() async throws {
+        guard !isCacheLoaded else { return }
+        logger.info("Loading directory cache...")
         
         // 1. Pre-cache ancestors of configuration roots so path resolution can walk to "/"
         for root in configuration.roots {
@@ -102,7 +118,8 @@ public actor FileIndexer {
         
         // 2. Load all directories from SQLite
         let sql = "SELECT volume_uuid, file_id, parent_id, name FROM fs_nodes WHERE is_directory = 1;"
-        if let rows = try? database.query(sql: sql) {
+        do {
+            let rows = try database.query(sql: sql)
             for row in rows {
                 guard let volumeUUID = row["volume_uuid"] as? String,
                       let fileIDVal = row["file_id"] as? Int64,
@@ -119,12 +136,19 @@ public actor FileIndexer {
                 }
                 directoryCache[volumeUUID]?[fileID] = (parentID, name)
             }
+            isCacheLoaded = true
+            let totalDirs = directoryCache.values.map(\.count).reduce(0, +)
+            logger.info("Loaded \(totalDirs) directories into cache.")
+        } catch {
+            logger.error("Failed to load directory cache: \(error.localizedDescription)")
+            throw error
         }
     }
 
-    private func resetCache() async {
+    private func resetCache() async throws {
         directoryCache.removeAll()
-        await ensureCacheLoaded()
+        isCacheLoaded = false
+        try await ensureCacheLoaded()
     }
 
     private func cacheAncestors(of root: URL, volumeUUID: String) {
@@ -202,6 +226,7 @@ public actor FileIndexer {
     }
 
     public func rebuild() async throws {
+        logger.info("Starting index rebuild...")
         try Task.checkCancellation()
         // Clear nodes table
         try database.execute(sql: "DELETE FROM fs_nodes;")
@@ -312,11 +337,12 @@ public actor FileIndexer {
         }
 
         try Task.checkCancellation()
-        await resetCache()
+        try await resetCache()
+        logger.info("Index rebuild completed successfully.")
     }
 
-    public func query(_ query: SearchQuery) async throws -> [SearchResult] {
-        await ensureCacheLoaded()
+    public func query(_ query: SearchQuery) async throws -> FileIndexQueryResult {
+        try await ensureCacheLoaded()
 
         let columns = "volume_uuid, file_id, parent_id, name, is_directory, file_extension, size, modification_date, uti"
         var cte = ""
@@ -416,67 +442,165 @@ public actor FileIndexer {
             sql += " ORDER BY name ASC"
         }
 
-        let requestedLimit = max(1, query.limit ?? 5_000)
-        sql += " LIMIT ?"
-        bindings.append(requestedLimit)
-        if let offset = query.offset, offset > 0, query.sortOption?.field != .path {
-            sql += " OFFSET ?"
-            bindings.append(offset)
-        }
-        sql += ";"
+        var results: [SearchResult] = []
+        var skippedCount = 0
+        var firstCorruption: String? = nil
+
+        let targetLimit = max(1, query.limit ?? 5_000)
+        let queryOffset = query.offset ?? 0
+        let isSortByPath = (query.sortOption?.field == .path)
 
         do {
-            let rows = try database.query(sql: cte.isEmpty ? sql : cte + "\n" + sql, bindings: bindings)
-            var results: [SearchResult] = []
-            results.reserveCapacity(rows.count)
+            if isSortByPath {
+                // Sorting by path: we cannot use SQLite LIMIT/OFFSET. We query all matches,
+                // resolve/filter, sort in memory, and then apply offset/limit.
+                let rows = try database.query(sql: cte.isEmpty ? sql : cte + "\n" + sql, bindings: bindings)
+                var allValidResults: [SearchResult] = []
+                allValidResults.reserveCapacity(rows.count)
 
-            for row in rows {
-                try Task.checkCancellation()
-                guard let volumeUUID = row["volume_uuid"] as? String,
-                      let fileIDValue = row["file_id"] as? Int64,
-                      let parentIDValue = row["parent_id"] as? Int64,
-                      let name = row["name"] as? String,
-                      row["is_directory"] is Int64 else {
-                    throw FileIndexSearchError.indexCorrupted(
-                        "查询结果包含缺失必要字段的节点。"
-                    )
+                for row in rows {
+                    try Task.checkCancellation()
+                    guard let volumeUUID = row["volume_uuid"] as? String,
+                          let fileIDValue = row["file_id"] as? Int64,
+                          let parentIDValue = row["parent_id"] as? Int64,
+                          let name = row["name"] as? String,
+                          row["is_directory"] is Int64 else {
+                        continue
+                    }
+
+                    do {
+                        let fullPath = try resolvePath(
+                            volumeUUID: volumeUUID,
+                            parentID: UInt64(bitPattern: parentIDValue),
+                            name: name
+                        )
+                        if let rawPrefix = query.pathPrefix {
+                            let prefix = Self.canonicalUserPath(rawPrefix)
+                            let path = Self.canonicalUserPath(fullPath)
+                            let normalizedPrefix = prefix.hasSuffix("/") ? prefix : prefix + "/"
+                            let normalizedPath = path.hasSuffix("/") ? path : path + "/"
+                            guard normalizedPath.hasPrefix(normalizedPrefix) || path == prefix else { continue }
+                        }
+                        guard !shouldExclude(fullPath) else { continue }
+
+                        allValidResults.append(SearchResult(
+                            metadata: FileMetadata(
+                                path: fullPath,
+                                filename: name,
+                                fileExtension: row["file_extension"] as? String ?? "",
+                                size: row["size"] as? Int64 ?? 0,
+                                modificationDate: (row["modification_date"] as? Double).map(Date.init(timeIntervalSince1970:)),
+                                fileID: UInt64(bitPattern: fileIDValue),
+                                uti: row["uti"] as? String
+                            ),
+                            source: [.filenameIndex]
+                        ))
+                    } catch {
+                        skippedCount += 1
+                        if firstCorruption == nil {
+                            firstCorruption = error.localizedDescription
+                        }
+                        logger.warning("Path resolution failed for '\(name)' (ID: \(fileIDValue), parentID: \(parentIDValue)): \(error.localizedDescription)")
+                    }
                 }
 
-                let fullPath = try resolvePath(
-                    volumeUUID: volumeUUID,
-                    parentID: UInt64(bitPattern: parentIDValue),
-                    name: name
+                // Sort by path
+                let sort = query.sortOption!
+                allValidResults.sort { sort.direction == .ascending ? $0.metadata.path < $1.metadata.path : $0.metadata.path > $1.metadata.path }
+
+                // Paging
+                let pagedResults: [SearchResult]
+                if queryOffset > 0 {
+                    pagedResults = queryOffset < allValidResults.count ? Array(allValidResults.dropFirst(queryOffset).prefix(targetLimit)) : []
+                } else {
+                    pagedResults = Array(allValidResults.prefix(targetLimit))
+                }
+
+                return FileIndexQueryResult(
+                    results: pagedResults,
+                    skippedCorruptNodeCount: skippedCount,
+                    firstCorruptionDescription: firstCorruption
                 )
-                if let rawPrefix = query.pathPrefix {
-                    let prefix = Self.canonicalUserPath(rawPrefix)
-                    let path = Self.canonicalUserPath(fullPath)
-                    let normalizedPrefix = prefix.hasSuffix("/") ? prefix : prefix + "/"
-                    let normalizedPath = path.hasSuffix("/") ? path : path + "/"
-                    guard normalizedPath.hasPrefix(normalizedPrefix) || path == prefix else { continue }
-                }
-                guard !shouldExclude(fullPath) else { continue }
+            } else {
+                // Non-path sorting: we can use SQLite LIMIT/OFFSET, but when we encounter skipped nodes,
+                // we query additional rows to back-fill up to the targetLimit.
+                var currentDatabaseOffset = queryOffset
+                var validNeeded = targetLimit
+                let safetyMaxRows = 50_000
+                var totalRowsProcessed = 0
 
-                results.append(SearchResult(
-                    metadata: FileMetadata(
-                        path: fullPath,
-                        filename: name,
-                        fileExtension: row["file_extension"] as? String ?? "",
-                        size: row["size"] as? Int64 ?? 0,
-                        modificationDate: (row["modification_date"] as? Double).map(Date.init(timeIntervalSince1970:)),
-                        fileID: UInt64(bitPattern: fileIDValue),
-                        uti: row["uti"] as? String
-                    ),
-                    source: [.filenameIndex]
-                ))
-            }
+                while validNeeded > 0 && totalRowsProcessed < safetyMaxRows {
+                    try Task.checkCancellation()
 
-            if let sort = query.sortOption, sort.field == .path {
-                results.sort { sort.direction == .ascending ? $0.metadata.path < $1.metadata.path : $0.metadata.path > $1.metadata.path }
-                if let offset = query.offset, offset > 0 {
-                    results = offset < results.count ? Array(results.dropFirst(offset)) : []
+                    let batchSQL = sql + " LIMIT ? OFFSET ?;"
+                    var batchBindings = bindings
+                    batchBindings.append(validNeeded)
+                    batchBindings.append(currentDatabaseOffset)
+
+                    let rows = try database.query(sql: cte.isEmpty ? batchSQL : cte + "\n" + batchSQL, bindings: batchBindings)
+                    if rows.isEmpty {
+                        break // No more rows in database
+                    }
+
+                    for row in rows {
+                        totalRowsProcessed += 1
+                        guard let volumeUUID = row["volume_uuid"] as? String,
+                              let fileIDValue = row["file_id"] as? Int64,
+                              let parentIDValue = row["parent_id"] as? Int64,
+                              let name = row["name"] as? String,
+                              row["is_directory"] is Int64 else {
+                            continue
+                        }
+
+                        do {
+                            let fullPath = try resolvePath(
+                                volumeUUID: volumeUUID,
+                                parentID: UInt64(bitPattern: parentIDValue),
+                                name: name
+                            )
+                            if let rawPrefix = query.pathPrefix {
+                                let prefix = Self.canonicalUserPath(rawPrefix)
+                                let path = Self.canonicalUserPath(fullPath)
+                                let normalizedPrefix = prefix.hasSuffix("/") ? prefix : prefix + "/"
+                                let normalizedPath = path.hasSuffix("/") ? path : path + "/"
+                                guard normalizedPath.hasPrefix(normalizedPrefix) || path == prefix else { continue }
+                            }
+                            guard !shouldExclude(fullPath) else { continue }
+
+                            results.append(SearchResult(
+                                metadata: FileMetadata(
+                                    path: fullPath,
+                                    filename: name,
+                                    fileExtension: row["file_extension"] as? String ?? "",
+                                    size: row["size"] as? Int64 ?? 0,
+                                    modificationDate: (row["modification_date"] as? Double).map(Date.init(timeIntervalSince1970:)),
+                                    fileID: UInt64(bitPattern: fileIDValue),
+                                    uti: row["uti"] as? String
+                                ),
+                                source: [.filenameIndex]
+                            ))
+                            validNeeded -= 1
+                        } catch {
+                            skippedCount += 1
+                            if firstCorruption == nil {
+                                firstCorruption = error.localizedDescription
+                            }
+                            logger.warning("Path resolution failed for '\(name)' (ID: \(fileIDValue), parentID: \(parentIDValue)): \(error.localizedDescription)")
+                        }
+                    }
+
+                    currentDatabaseOffset += rows.count
+                    if rows.count < validNeeded {
+                        break // SQLite returned fewer rows than requested, database is exhausted
+                    }
                 }
+
+                return FileIndexQueryResult(
+                    results: results,
+                    skippedCorruptNodeCount: skippedCount,
+                    firstCorruptionDescription: firstCorruption
+                )
             }
-            return results
         } catch let error as FileIndexSearchError {
             throw error
         } catch {
@@ -494,7 +618,7 @@ public actor FileIndexer {
     }
 
     public func upsert(path: String) async throws {
-        await ensureCacheLoaded()
+        try await ensureCacheLoaded()
 
         guard !shouldExclude(path) else {
             try await remove(path: path)
@@ -640,7 +764,7 @@ public actor FileIndexer {
     }
 
     public func remove(path: String) async throws {
-        await ensureCacheLoaded()
+        try await ensureCacheLoaded()
 
         if let (volumeUUID, fileID) = nodeID(for: path) {
             if directoryCache[volumeUUID]?[fileID] != nil {

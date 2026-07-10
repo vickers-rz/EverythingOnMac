@@ -66,10 +66,15 @@ public actor SearchCoordinator {
                 var indexed: [SearchResult] = []
                 var indexError: FileIndexSearchError?
                 var indexWasTruncated = desiredCandidates > policy.maximumCandidateLimit
+                var skippedCorruptNodeCount = 0
+                var firstCorruptionDescription: String? = nil
 
                 if query.mode != .contentOnly {
                     do {
-                        indexed = try await indexer.query(indexQuery)
+                        let queryResult = try await indexer.query(indexQuery)
+                        indexed = queryResult.results
+                        skippedCorruptNodeCount = queryResult.skippedCorruptNodeCount
+                        firstCorruptionDescription = queryResult.firstCorruptionDescription
                         if indexed.count > candidateLimit {
                             indexWasTruncated = true
                             indexed.removeLast(indexed.count - candidateLimit)
@@ -87,7 +92,9 @@ public actor SearchCoordinator {
                     query: query,
                     indexError: indexError,
                     contentError: nil,
-                    indexWasTruncated: indexWasTruncated
+                    indexWasTruncated: indexWasTruncated,
+                    skippedCorruptNodeCount: skippedCorruptNodeCount,
+                    firstCorruptionDescription: firstCorruptionDescription
                 ))
 
                 guard query.mode != .filenameOnly else {
@@ -114,7 +121,9 @@ public actor SearchCoordinator {
                                 query: query,
                                 indexError: indexError,
                                 contentError: nil,
-                                indexWasTruncated: indexWasTruncated
+                                indexWasTruncated: indexWasTruncated,
+                                skippedCorruptNodeCount: skippedCorruptNodeCount,
+                                firstCorruptionDescription: firstCorruptionDescription
                             ))
                             pendingCount = 0
                             yieldedContent = true
@@ -128,7 +137,9 @@ public actor SearchCoordinator {
                             query: query,
                             indexError: indexError,
                             contentError: nil,
-                            indexWasTruncated: indexWasTruncated
+                            indexWasTruncated: indexWasTruncated,
+                            skippedCorruptNodeCount: skippedCorruptNodeCount,
+                            firstCorruptionDescription: firstCorruptionDescription
                         ))
                     }
                     continuation.finish()
@@ -141,7 +152,9 @@ public actor SearchCoordinator {
                             query: query,
                             indexError: indexError,
                             contentError: error,
-                            indexWasTruncated: indexWasTruncated
+                            indexWasTruncated: indexWasTruncated,
+                            skippedCorruptNodeCount: skippedCorruptNodeCount,
+                            firstCorruptionDescription: firstCorruptionDescription
                         ))
                     }
                     continuation.finish()
@@ -151,7 +164,9 @@ public actor SearchCoordinator {
                         query: query,
                         indexError: indexError,
                         contentError: .launchFailed(error.localizedDescription),
-                        indexWasTruncated: indexWasTruncated
+                        indexWasTruncated: indexWasTruncated,
+                        skippedCorruptNodeCount: skippedCorruptNodeCount,
+                        firstCorruptionDescription: firstCorruptionDescription
                     ))
                     continuation.finish()
                 }
@@ -231,7 +246,9 @@ public actor SearchCoordinator {
         query: SearchQuery,
         indexError: FileIndexSearchError?,
         contentError: RipgrepSearchError?,
-        indexWasTruncated: Bool
+        indexWasTruncated: Bool,
+        skippedCorruptNodeCount: Int = 0,
+        firstCorruptionDescription: String? = nil
     ) -> SearchResponse {
         let sorted = sortedResults(from: mergedByPath, query: query)
         let offset = max(0, query.offset ?? 0)
@@ -239,13 +256,15 @@ public actor SearchCoordinator {
         let available = offset < sorted.count ? Array(sorted.dropFirst(offset)) : []
         let visible = Array(available.prefix(limit))
         let truncated = indexWasTruncated || available.count > limit
-
+        
         return SearchResponse(
             results: visible,
             indexError: indexError,
             contentError: contentError,
             isTruncated: truncated,
-            totalCandidateCount: sorted.count
+            totalCandidateCount: sorted.count,
+            skippedCorruptNodeCount: skippedCorruptNodeCount,
+            firstCorruptionDescription: firstCorruptionDescription
         )
     }
 }
