@@ -5,9 +5,9 @@
 ## 当前实现（MVP 基线）
 
 - 文件名/路径索引搜索（内存索引，支持排除目录）
-- APFS 友好的元数据采集：读取卷格式、持久 File ID 能力，并在索引中保留文件系统资源标识
+- APFS 友好的元数据采集：通过 macOS `statfs`/URL resource values 读取卷格式、持久 File ID 能力，并在索引中保留文件系统资源标识
 - FSEvents 增量监听：macOS 下监听文件创建、修改、删除并增量更新索引
-- ripgrep 正文检索通道（自动发现 `rg`，支持 `RG_PATH` 环境变量覆盖，结构化 JSON 结果解析）
+- ripgrep 正文检索通道（自动发现 `rg`，支持 `RG_PATH`/PATH 环境变量覆盖，结构化 JSON 结果解析）
 - 混合查询编排（文件索引结果 + 正文命中结果合并）
 - SwiftUI macOS 原生界面（双击在 Finder 中定位）
 - 查询语法支持：

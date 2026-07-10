@@ -132,6 +132,16 @@ public actor FileIndexer {
         switch identifier {
         case let number as NSNumber:
             return number.uint64Value
+        case let data as Data:
+            return data.withUnsafeBytes { rawBuffer in
+                guard let baseAddress = rawBuffer.baseAddress else { return nil }
+                let byteCount = min(rawBuffer.count, MemoryLayout<UInt64>.size)
+                var value: UInt64 = 0
+                withUnsafeMutableBytes(of: &value) { destination in
+                    destination.copyBytes(from: UnsafeRawBufferPointer(start: baseAddress, count: byteCount))
+                }
+                return value
+            }
         default:
             return nil
         }
