@@ -563,25 +563,57 @@ public actor FileIndexer {
         if let value = query.maxDate, let op = query.maxDateOp { predicates.append("o.modification_date \(op) ?"); bindings.append(value.timeIntervalSince1970) }
         if let uti = query.utiFilter, !uti.isEmpty { predicates.append("o.uti LIKE ?"); bindings.append("%\(uti)%") }
 
-        let sql = """
+        let identitySQL = """
+            \(cte)
+            SELECT e.volume_uuid, e.target_file_id
+            FROM fs_entries e
+            JOIN fs_objects o ON o.volume_uuid = e.volume_uuid AND o.file_id = e.target_file_id
+            WHERE \(predicates.joined(separator: " AND "))
+            GROUP BY e.volume_uuid, e.target_file_id
+            ORDER BY e.volume_uuid, e.target_file_id
+            LIMIT ?;
+            """
+        var identityBindings = cteBindings + bindings
+        identityBindings.append(boundedLimit + 1)
+        let identityRows = try database.query(sql: identitySQL, bindings: identityBindings)
+        let selectedIdentities = identityRows.prefix(boundedLimit).compactMap { row -> FileIdentity? in
+            guard let volume = row["volume_uuid"] as? String,
+                  let target = row["target_file_id"] as? Int64 else { return nil }
+            return FileIdentity(volumeUUID: volume, fileID: UInt64(bitPattern: target))
+        }
+        guard !selectedIdentities.isEmpty else {
+            return ContentCandidateResult(
+                entries: [],
+                skippedCorruptNodeCount: 0,
+                firstCorruptionDescription: nil,
+                isTruncated: false
+            )
+        }
+
+        let identityPredicates = selectedIdentities.map { _ in
+            "(e.volume_uuid = ? AND e.target_file_id = ?)"
+        }.joined(separator: " OR ")
+        let entrySQL = """
             \(cte)
             SELECT e.entry_id, e.volume_uuid, e.parent_file_id, e.target_file_id, e.name,
                    o.file_extension, o.size, o.modification_date, o.uti
             FROM fs_entries e
             JOIN fs_objects o ON o.volume_uuid = e.volume_uuid AND o.file_id = e.target_file_id
             WHERE \(predicates.joined(separator: " AND "))
-            ORDER BY e.volume_uuid, e.target_file_id, e.entry_id
-            LIMIT ?;
+              AND (\(identityPredicates))
+            ORDER BY e.volume_uuid, e.target_file_id, e.entry_id;
             """
-        var allBindings = cteBindings + bindings
-        allBindings.append(boundedLimit + 1)
-        let rows = try database.query(sql: sql, bindings: allBindings)
+        var entryBindings = cteBindings + bindings
+        for identity in selectedIdentities {
+            entryBindings += [identity.volumeUUID, Int64(bitPattern: identity.fileID)]
+        }
+        let rows = try database.query(sql: entrySQL, bindings: entryBindings)
 
         var entries: [IndexedEntry] = []
-        entries.reserveCapacity(min(rows.count, boundedLimit))
+        entries.reserveCapacity(rows.count)
         var skipped = 0
         var firstCorruption: String?
-        for row in rows.prefix(boundedLimit) {
+        for row in rows {
             try Task.checkCancellation()
             do {
                 guard let entryID = row["entry_id"] as? Int64,
@@ -612,7 +644,7 @@ public actor FileIndexer {
             entries: entries,
             skippedCorruptNodeCount: skipped,
             firstCorruptionDescription: firstCorruption,
-            isTruncated: rows.count > boundedLimit
+            isTruncated: identityRows.count > boundedLimit
         )
     }
 

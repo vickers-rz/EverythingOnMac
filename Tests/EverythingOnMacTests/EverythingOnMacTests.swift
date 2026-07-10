@@ -902,6 +902,40 @@ func hardlinkContentSearchDeduplicatesReads() async throws {
     #expect(scannedPaths[0] == canonicalOriginal || scannedPaths[0] == canonicalLinked)
 }
 
+@Test("Content candidate limit counts identities without splitting hardlink entries")
+func contentCandidateLimitPreservesAllHardlinkEntries() async throws {
+    let root = canonicalPath(for: NSTemporaryDirectory() + UUID().uuidString) + "/"
+    let dirA = root + "A/"
+    let dirB = root + "B/"
+    try FileManager.default.createDirectory(atPath: dirA, withIntermediateDirectories: true)
+    try FileManager.default.createDirectory(atPath: dirB, withIntermediateDirectories: true)
+    defer { try? FileManager.default.removeItem(atPath: root) }
+
+    let original = dirA + "one.txt"
+    let linked = dirB + "two.txt"
+    try "needle".write(toFile: original, atomically: true, encoding: .utf8)
+    try FileManager.default.linkItem(atPath: original, toPath: linked)
+
+    let indexer = try FileIndexer(configuration: IndexerConfiguration(
+        roots: [URL(fileURLWithPath: root)],
+        databasePath: root + "identity-limit.db",
+        useFastVolumeScan: false
+    ))
+    try await indexer.upsert(path: dirA)
+    try await indexer.upsert(path: dirB)
+    try await indexer.upsert(path: original)
+    try await indexer.upsert(path: linked)
+
+    var query = QueryParser.parse("needle", mode: .contentOnly)
+    query.fileExtensions = ["txt"]
+    let candidates = try await indexer.contentCandidates(for: query, limit: 1)
+
+    #expect(candidates.entries.count == 2)
+    #expect(Set(candidates.entries.map(\.identity)).count == 1)
+    #expect(Set(candidates.entries.map(\.entryID)).count == 2)
+    #expect(!candidates.isTruncated)
+}
+
 @Test("Benchmark fuzzy query with bitmask pre-filtering on 10000 synthetic rows")
 func benchmarkFuzzyBitmaskQuery() async throws {
     let dbPath = NSTemporaryDirectory() + UUID().uuidString + "_bench.db"
