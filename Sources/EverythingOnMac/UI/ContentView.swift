@@ -26,6 +26,10 @@ struct ContentView: View {
 
             HStack {
                 Text(viewModel.isIndexing ? "索引构建中..." : "索引已就绪")
+                Text("已索引: \(viewModel.indexedCount)")
+                if let firstVolume = viewModel.volumeCapabilities.first {
+                    Text(firstVolume.isAPFS ? "APFS/持久 File ID" : "标准文件系统索引")
+                }
                 Spacer()
                 Text("结果: \(viewModel.results.count)")
             }

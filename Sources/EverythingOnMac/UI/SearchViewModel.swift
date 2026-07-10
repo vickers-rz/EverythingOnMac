@@ -11,17 +11,24 @@ final class SearchViewModel: ObservableObject {
     @Published var mode: SearchMode = .mixed
     @Published var results: [SearchResult] = []
     @Published var indexedCount: Int = 0
+    @Published var volumeCapabilities: [VolumeCapabilities] = []
     @Published var isIndexing = false
     @Published var lastError: String?
 
     private let coordinator: SearchCoordinator
     private var searchTask: Task<Void, Never>?
+    private var eventMonitor: FileSystemEventMonitor?
 
     init(roots: [URL] = [URL(fileURLWithPath: NSHomeDirectory())]) {
         let excluded = ["/System", "/private/var", "/Library/Caches"]
         let indexer = FileIndexer(configuration: IndexerConfiguration(roots: roots, excludedPaths: excluded))
-        let ripgrep = RipgrepSearcher(configuration: RipgrepConfiguration(executablePath: "/opt/homebrew/bin/rg"))
+        let ripgrep = RipgrepSearcher(configuration: RipgrepConfiguration())
         self.coordinator = SearchCoordinator(indexer: indexer, ripgrepSearcher: ripgrep, roots: roots)
+        self.volumeCapabilities = coordinator.inspectVolumes()
+        self.eventMonitor = FileSystemEventMonitor(roots: roots) { [coordinator] changes in
+            Task { await coordinator.apply(changes: changes) }
+        }
+        self.eventMonitor?.start()
 
         Task { await rebuildIndex() }
     }
@@ -29,7 +36,7 @@ final class SearchViewModel: ObservableObject {
     func rebuildIndex() async {
         isIndexing = true
         await coordinator.rebuildIndex()
-        indexedCount = await coordinator.search(query: SearchQuery(raw: "", terms: [])).count
+        indexedCount = await coordinator.indexedItemCount()
         isIndexing = false
     }
 

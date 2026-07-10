@@ -4,9 +4,29 @@ public struct RipgrepConfiguration: Sendable {
     public var executablePath: String
     public var timeoutSeconds: TimeInterval
 
-    public init(executablePath: String = "/usr/bin/rg", timeoutSeconds: TimeInterval = 8) {
+    public init(executablePath: String = RipgrepConfiguration.defaultExecutablePath(), timeoutSeconds: TimeInterval = 8) {
         self.executablePath = executablePath
         self.timeoutSeconds = timeoutSeconds
+    }
+
+    public static func defaultExecutablePath() -> String {
+        let candidates = [
+            ProcessInfo.processInfo.environment["RG_PATH"],
+            "/opt/homebrew/bin/rg",
+            "/usr/local/bin/rg",
+            "/usr/bin/rg",
+            executableOnPATH(named: "rg")
+        ].compactMap { $0 }
+        return candidates.first { FileManager.default.isExecutableFile(atPath: $0) } ?? "rg"
+    }
+
+    private static func executableOnPATH(named executableName: String) -> String? {
+        ProcessInfo.processInfo.environment["PATH"]?
+            .split(separator: ":")
+            .map { String($0) }
+            .lazy
+            .map { URL(fileURLWithPath: $0).appendingPathComponent(executableName).path }
+            .first { FileManager.default.isExecutableFile(atPath: $0) }
     }
 }
 
@@ -28,10 +48,10 @@ public actor RipgrepSearcher {
         }
 
         var args = ["--json", "--line-number", "--column", "--color", "never", "--no-heading"]
-        args.append(query.isRegex ? pattern : "--fixed-strings")
         if !query.isRegex {
-            args.append(pattern)
+            args.append("--fixed-strings")
         }
+        args.append(pattern)
         if query.isCaseSensitive {
             args.append("--case-sensitive")
         } else {
@@ -40,7 +60,10 @@ public actor RipgrepSearcher {
         for ext in query.fileExtensions {
             args.append(contentsOf: ["-g", "*.\(ext)"])
         }
-        for root in roots {
+        for excluded in query.excludedTerms {
+            args.append(contentsOf: ["-g", "!*\(excluded)*"])
+        }
+        for root in contentRoots(for: query, roots: roots) {
             args.append(root.path)
         }
 
@@ -50,6 +73,23 @@ public actor RipgrepSearcher {
         } catch {
             return []
         }
+    }
+
+    private func contentRoots(for query: SearchQuery, roots: [URL]) -> [URL] {
+        guard let pathPrefix = query.pathPrefix, !pathPrefix.isEmpty else {
+            return roots
+        }
+
+        let prefixURL = URL(fileURLWithPath: pathPrefix)
+        var isDirectory: ObjCBool = false
+        if FileManager.default.fileExists(atPath: pathPrefix, isDirectory: &isDirectory), isDirectory.boolValue {
+            return [prefixURL]
+        }
+
+        let matchingRoots = roots.filter { root in
+            pathPrefix.hasPrefix(root.path) || root.path.hasPrefix(pathPrefix)
+        }
+        return matchingRoots.isEmpty ? roots : matchingRoots
     }
 
     private func runRipgrep(arguments: [String]) async throws -> String {
