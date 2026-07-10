@@ -24,6 +24,7 @@ public struct IndexerConfiguration: Sendable {
 private final class ScanContext {
     var matches: [[Any]] = []
     var writeError: Error?
+    var isCancelled = false
     let volumeUUID: String
     let database: SQLiteDatabase
 
@@ -47,6 +48,7 @@ private final class ScanContext {
 public enum FileIndexSearchError: Error, Sendable, Equatable, LocalizedError {
     case invalidPathPrefix(String)
     case databaseError(String)
+    case indexCorrupted(String)
 
     public var errorDescription: String? {
         switch self {
@@ -54,6 +56,8 @@ public enum FileIndexSearchError: Error, Sendable, Equatable, LocalizedError {
             return "无法解析搜索路径：\(path)"
         case .databaseError(let message):
             return "文件索引查询失败：\(message)"
+        case .indexCorrupted(let message):
+            return "文件索引结构损坏：\(message)"
         }
     }
 }
@@ -151,24 +155,36 @@ public actor FileIndexer {
         }
     }
 
-    private func resolvePath(volumeUUID: String, parentID: UInt64, name: String) -> String {
+    private func resolvePath(volumeUUID: String, parentID: UInt64, name: String) throws -> String {
         var parts: [String] = [name]
         var currentParent = parentID
         var depth = 0
-        
-        while currentParent != 0 && currentParent != 2 && depth < 100 {
-            if let node = directoryCache[volumeUUID]?[currentParent] {
-                parts.append(node.name)
-                currentParent = node.parentID
-            } else {
-                break
+        var visited = Set<UInt64>()
+
+        while currentParent != 0 && currentParent != 2 {
+            guard depth < 100 else {
+                throw FileIndexSearchError.indexCorrupted(
+                    "节点 \(name) 的父目录层级超过 100。"
+                )
             }
+            guard visited.insert(currentParent).inserted else {
+                throw FileIndexSearchError.indexCorrupted(
+                    "节点 \(name) 的父目录链存在循环引用。"
+                )
+            }
+            guard let node = directoryCache[volumeUUID]?[currentParent] else {
+                throw FileIndexSearchError.indexCorrupted(
+                    "节点 \(name) 缺少父目录 \(currentParent)。"
+                )
+            }
+            parts.append(node.name)
+            currentParent = node.parentID
             depth += 1
         }
-        
+
         let relativePath = parts.reversed().joined(separator: "/")
         let mountPoint = volumeMountPoints[volumeUUID] ?? ""
-        
+
         let fullPath: String
         if mountPoint == "/" {
             fullPath = "/" + relativePath
@@ -186,19 +202,22 @@ public actor FileIndexer {
     }
 
     public func rebuild() async throws {
+        try Task.checkCancellation()
         // Clear nodes table
         try database.execute(sql: "DELETE FROM fs_nodes;")
         directoryCache.removeAll()
-        
+
         // Re-cache ancestors
         for root in configuration.roots {
+            try Task.checkCancellation()
             let values = try? root.resourceValues(forKeys: [.volumeUUIDStringKey])
             let volumeUUID = values?.volumeUUIDString ?? root.path
             cacheAncestors(of: root, volumeUUID: volumeUUID)
         }
-        
+
         var scannedVolumes = Set<String>()
         for root in configuration.roots {
+            try Task.checkCancellation()
             let values = try? root.resourceValues(forKeys: [.volumeUUIDStringKey])
             let volumeUUID = values?.volumeUUIDString ?? root.path
             
@@ -222,6 +241,13 @@ public actor FileIndexer {
             let errCode = scan_volume_catalog(physicalMountPoint, { fileID, parentID, namePtr, isDir, size, modDate, ctxPointer in
                 guard let ctxPointer = ctxPointer else { return }
                 let ctx = Unmanaged<ScanContext>.fromOpaque(ctxPointer).takeUnretainedValue()
+                if Task.isCancelled {
+                    ctx.isCancelled = true
+                    ctx.matches.removeAll(keepingCapacity: false)
+                    return
+                }
+                guard !ctx.isCancelled else { return }
+
                 let name = namePtr.map { String(cString: $0) } ?? ""
                 let ext = name.split(separator: ".").last.map { String($0).lowercased() } ?? ""
 
@@ -244,6 +270,11 @@ public actor FileIndexer {
                 }
             }, contextPointer)
 
+            if scanCtx.isCancelled {
+                throw CancellationError()
+            }
+            try Task.checkCancellation()
+
             guard errCode == 0 else {
                 try scanVolumeRecursively(volumeUUID: volumeUUID, rootsOnThisVolume: rootsOnThisVolume)
                 continue
@@ -253,6 +284,7 @@ public actor FileIndexer {
             if let writeError = scanCtx.writeError {
                 throw writeError
             }
+            try Task.checkCancellation()
             let rootIDs = rootsOnThisVolume.compactMap { candidate -> UInt64? in
                 let values = try? candidate.resourceValues(forKeys: [.fileResourceIdentifierKey])
                 return normalizeFileID(values?.fileResourceIdentifier)
@@ -266,15 +298,20 @@ public actor FileIndexer {
             }
 
             do {
+                try Task.checkCancellation()
                 try pruneDatabase(volumeUUID: volumeUUID, rootIDs: rootIDs)
+                try Task.checkCancellation()
                 try pruneExcludedPaths(volumeUUID: volumeUUID)
+            } catch is CancellationError {
+                throw CancellationError()
             } catch {
                 // Never keep a partially pruned volume index.
                 try? database.execute(sql: "DELETE FROM fs_nodes WHERE volume_uuid = ?;", bindings: [volumeUUID])
                 try scanVolumeRecursively(volumeUUID: volumeUUID, rootsOnThisVolume: rootsOnThisVolume)
             }
         }
-        
+
+        try Task.checkCancellation()
         await resetCache()
     }
 
@@ -390,14 +427,22 @@ public actor FileIndexer {
 
         do {
             let rows = try database.query(sql: cte.isEmpty ? sql : cte + "\n" + sql, bindings: bindings)
-            var results = rows.compactMap { row -> SearchResult? in
+            var results: [SearchResult] = []
+            results.reserveCapacity(rows.count)
+
+            for row in rows {
+                try Task.checkCancellation()
                 guard let volumeUUID = row["volume_uuid"] as? String,
                       let fileIDValue = row["file_id"] as? Int64,
                       let parentIDValue = row["parent_id"] as? Int64,
                       let name = row["name"] as? String,
-                      row["is_directory"] is Int64 else { return nil }
+                      row["is_directory"] is Int64 else {
+                    throw FileIndexSearchError.indexCorrupted(
+                        "查询结果包含缺失必要字段的节点。"
+                    )
+                }
 
-                let fullPath = resolvePath(
+                let fullPath = try resolvePath(
                     volumeUUID: volumeUUID,
                     parentID: UInt64(bitPattern: parentIDValue),
                     name: name
@@ -407,11 +452,11 @@ public actor FileIndexer {
                     let path = Self.canonicalUserPath(fullPath)
                     let normalizedPrefix = prefix.hasSuffix("/") ? prefix : prefix + "/"
                     let normalizedPath = path.hasSuffix("/") ? path : path + "/"
-                    guard normalizedPath.hasPrefix(normalizedPrefix) || path == prefix else { return nil }
+                    guard normalizedPath.hasPrefix(normalizedPrefix) || path == prefix else { continue }
                 }
-                guard !shouldExclude(fullPath) else { return nil }
+                guard !shouldExclude(fullPath) else { continue }
 
-                return SearchResult(
+                results.append(SearchResult(
                     metadata: FileMetadata(
                         path: fullPath,
                         filename: name,
@@ -422,7 +467,7 @@ public actor FileIndexer {
                         uti: row["uti"] as? String
                     ),
                     source: [.filenameIndex]
-                )
+                ))
             }
 
             if let sort = query.sortOption, sort.field == .path {
@@ -683,6 +728,7 @@ public actor FileIndexer {
 
     private func scanVolumeRecursively(volumeUUID: String, rootsOnThisVolume: [URL]) throws {
         for rootToScan in rootsOnThisVolume {
+            try Task.checkCancellation()
             guard let enumerator = FileManager.default.enumerator(
                 at: rootToScan,
                 includingPropertiesForKeys: [.isRegularFileKey, .isDirectoryKey, .fileSizeKey, .contentModificationDateKey, .fileResourceIdentifierKey, .typeIdentifierKey, .volumeUUIDStringKey, .parentDirectoryURLKey],
@@ -692,7 +738,12 @@ public actor FileIndexer {
             }
             
             var batch: [[Any]] = []
+            var scannedItemCount = 0
             while let fileURL = enumerator.nextObject() as? URL {
+                scannedItemCount += 1
+                if scannedItemCount % 256 == 0 {
+                    try Task.checkCancellation()
+                }
                 if shouldExclude(fileURL.path) {
                     enumerator.skipDescendants()
                     continue
@@ -737,6 +788,7 @@ public actor FileIndexer {
                 ])
                 
                 if batch.count >= 10000 {
+                    try Task.checkCancellation()
                     try database.executeBatch(
                         sql: "INSERT OR REPLACE INTO fs_nodes (volume_uuid, file_id, parent_id, name, name_character_mask, is_directory, file_extension, size, modification_date, uti) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?);",
                         items: batch
@@ -746,6 +798,7 @@ public actor FileIndexer {
             }
             
             if !batch.isEmpty {
+                try Task.checkCancellation()
                 try database.executeBatch(
                     sql: "INSERT OR REPLACE INTO fs_nodes (volume_uuid, file_id, parent_id, name, name_character_mask, is_directory, file_extension, size, modification_date, uti) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?);",
                     items: batch

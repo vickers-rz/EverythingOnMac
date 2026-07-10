@@ -28,12 +28,14 @@ public actor SearchCoordinator {
 
     public func apply(changes: [FileSystemChange], eventID: UInt64) async throws {
         for change in changes {
+            try Task.checkCancellation()
             if change.isRemoval {
                 try await indexer.remove(path: change.path)
             } else {
                 try await indexer.upsert(path: change.path)
             }
         }
+        try Task.checkCancellation()
         await indexer.setLastEventID(eventID)
     }
 

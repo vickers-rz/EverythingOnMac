@@ -198,29 +198,52 @@ public enum QueryParser {
         var tokens: [String] = []
         var current = ""
         var inQuote = false
+        var escaped = false
+        var hasAddedContentForCurrentToken = false
 
         for char in string {
+            if escaped {
+                if char == "\"" || char == "\\" {
+                    current.append(char)
+                } else {
+                    current.append("\\")
+                    current.append(char)
+                }
+                escaped = false
+                hasAddedContentForCurrentToken = true
+                continue
+            }
+
+            if char == "\\" {
+                escaped = true
+                continue
+            }
+
             if char == "\"" {
                 inQuote.toggle()
-                if !inQuote && !current.isEmpty {
-                    tokens.append(current)
-                    current = ""
-                }
+                hasAddedContentForCurrentToken = true
                 continue
             }
 
             if char.isWhitespace && !inQuote {
-                if !current.isEmpty {
+                if hasAddedContentForCurrentToken || !current.isEmpty {
                     tokens.append(current)
                     current = ""
+                    hasAddedContentForCurrentToken = false
                 }
                 continue
             }
 
             current.append(char)
+            hasAddedContentForCurrentToken = true
         }
 
-        if !current.isEmpty {
+        if escaped {
+            current.append("\\")
+            hasAddedContentForCurrentToken = true
+        }
+
+        if hasAddedContentForCurrentToken || !current.isEmpty {
             tokens.append(current)
         }
 

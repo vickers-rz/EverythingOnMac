@@ -34,6 +34,27 @@ func parserSupportsStructuredTokens() {
     #expect(query.isCaseSensitive)
 }
 
+@Test("QueryParser parses escape sequences and quotes concatenation")
+func queryParserEscapingAndConcatenation() {
+    let query1 = QueryParser.parse(#"name:"a \"quoted\" file""#, mode: .mixed)
+    #expect(query1.terms == ["name:a \"quoted\" file"])
+    
+    let query2 = QueryParser.parse("abc\"def ghi\"jkl", mode: .mixed)
+    #expect(query2.terms == ["abcdef ghijkl"])
+    
+    let query3 = QueryParser.parse(#"path:"my folder""#, mode: .mixed)
+    #expect(query3.pathPrefix == "my folder")
+    
+    let query4 = QueryParser.parse(#""hello"#, mode: .mixed)
+    #expect(query4.terms == ["hello"])
+
+    // Additional tests for backslash escaping behavior
+    #expect(QueryParser.parse(#"\d+ regex:true"#).terms == [#"\d+"#])
+    #expect(QueryParser.parse(#"\.txt$ regex:true"#).terms == [#"\.txt$"#])
+    #expect(QueryParser.parse(#"foo\bar"#).terms == [#"foo\bar"#])
+    #expect(QueryParser.parse(#"foo\\bar"#).terms == [#"foo\bar"#])
+}
+
 @Test("Merge unions source and content matches")
 func mergeCombinesIndexAndContent() {
     let metadata = FileMetadata(
@@ -346,6 +367,40 @@ func rebuildPrunesExcludedPaths() async throws {
     #expect(!filenames.contains("skip.txt"))
 }
 
+@Test("FileIndexer reports invalid directory structures as index corruption")
+func fileIndexerResolvePathInvalidStructures() async throws {
+    let dbPath = NSTemporaryDirectory() + UUID().uuidString + ".db"
+    defer { try? FileManager.default.removeItem(atPath: dbPath) }
+
+    let db = try SQLiteDatabase(path: dbPath)
+
+    // We create structural nodes directly in DB.
+    // 1. Missing parent node: parent_id = 9999 (which does not exist in directoryCache)
+    try db.execute(sql: "INSERT INTO fs_nodes (volume_uuid, file_id, parent_id, name, is_directory, file_extension, size, modification_date) VALUES (?, ?, ?, ?, ?, ?, ?, ?);",
+                   bindings: ["vol-1", 100, 9999, "missing_parent.txt", 0, "txt", 10, Date().timeIntervalSince1970])
+
+    // 2. Cycle parent node: file_id = 200 (parent = 201), file_id = 201 (parent = 200)
+    try db.execute(sql: "INSERT INTO fs_nodes (volume_uuid, file_id, parent_id, name, is_directory, file_extension, size, modification_date) VALUES (?, ?, ?, ?, ?, ?, ?, ?);",
+                   bindings: ["vol-1", 200, 201, "dirA", 1, "", 0, Date().timeIntervalSince1970])
+    try db.execute(sql: "INSERT INTO fs_nodes (volume_uuid, file_id, parent_id, name, is_directory, file_extension, size, modification_date) VALUES (?, ?, ?, ?, ?, ?, ?, ?);",
+                   bindings: ["vol-1", 201, 200, "dirB", 1, "", 0, Date().timeIntervalSince1970])
+    try db.execute(sql: "INSERT INTO fs_nodes (volume_uuid, file_id, parent_id, name, is_directory, file_extension, size, modification_date) VALUES (?, ?, ?, ?, ?, ?, ?, ?);",
+                   bindings: ["vol-1", 202, 200, "cycle.txt", 0, "txt", 10, Date().timeIntervalSince1970])
+
+    let config = IndexerConfiguration(roots: [URL(fileURLWithPath: "/tmp")], databasePath: dbPath)
+    let indexer = try FileIndexer(configuration: config)
+
+    do {
+        _ = try await indexer.query(QueryParser.parse(""))
+        Issue.record("Expected indexCorrupted")
+    } catch let error as FileIndexSearchError {
+        guard case .indexCorrupted = error else {
+            Issue.record("Unexpected file-index error: \(error)")
+            return
+        }
+    }
+}
+
 @Test("Unresolvable pathPrefix throws invalidPathPrefix error")
 func unresolvablePathPrefixReturnsEmpty() async throws {
     let rawTempDir = NSTemporaryDirectory() + UUID().uuidString + "/"
@@ -654,6 +709,17 @@ func sqliteFuzzyScoreFunctionTests() throws {
     // Test non-match
     let rowsNoMatch = try db.query(sql: "SELECT FUZZY_SCORE(?, ?, ?) as score;", bindings: ["xyz", "ApplicationCache", false])
     #expect(rowsNoMatch.first?["score"] is NSNull)
+
+    // Test that auxdata updates correctly when case-sensitivity changes or when query changes
+    // within the same query execution statement.
+    try db.execute(sql: "CREATE TABLE test_scores (name TEXT, case_flag INTEGER);")
+    try db.execute(sql: "INSERT INTO test_scores (name, case_flag) VALUES ('abc', 0);")
+    try db.execute(sql: "INSERT INTO test_scores (name, case_flag) VALUES ('abc', 1);")
+
+    let rowsMixed = try db.query(sql: "SELECT FUZZY_SCORE('ABC', name, case_flag) as score FROM test_scores;")
+    #expect(rowsMixed.count == 2)
+    #expect(rowsMixed[0]["score"] is Int64)  // case_flag = 0 -> case insensitive match -> positive score
+    #expect(rowsMixed[1]["score"] is NSNull) // case_flag = 1 -> case sensitive match -> no match (NULL)
 }
 
 @Test("Relevance scorer correctly ranks hybrid and base scores")

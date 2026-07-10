@@ -212,7 +212,19 @@ public final class SQLiteDatabase: @unchecked Sendable {
                 let prepared: FuzzyMatcher.PreparedQuery
                 if let auxPtr = sqlite3_get_auxdata(ctx, 0) {
                     let wrapper = Unmanaged<PreparedQueryWrapper>.fromOpaque(auxPtr).takeUnretainedValue()
-                    prepared = wrapper.query
+                    if wrapper.query.original == queryStr && wrapper.query.caseSensitive == isCaseSensitive {
+                        prepared = wrapper.query
+                    } else {
+                        let prep = FuzzyMatcher.prepare(query: queryStr, caseSensitive: isCaseSensitive)
+                        let newWrapper = PreparedQueryWrapper(query: prep)
+                        let pointer = Unmanaged.passRetained(newWrapper).toOpaque()
+                        prepared = prep
+                        sqlite3_set_auxdata(ctx, 0, pointer) { ptr in
+                            if let ptr = ptr {
+                                Unmanaged<PreparedQueryWrapper>.fromOpaque(ptr).release()
+                            }
+                        }
+                    }
                 } else {
                     let prep = FuzzyMatcher.prepare(query: queryStr, caseSensitive: isCaseSensitive)
                     let wrapper = PreparedQueryWrapper(query: prep)
@@ -369,27 +381,36 @@ public final class SQLiteDatabase: @unchecked Sendable {
 // transient binding constants
 private let SQLITE_TRANSIENT = unsafeBitCast(-1, to: sqlite3_destructor_type.self)
 
-private final class SQLiteRegexCache {
+private final class SQLiteRegexCache: @unchecked Sendable {
     struct Key: Hashable {
         let pattern: String
         let isCaseSensitive: Bool
     }
-    var cache: [Key: NSRegularExpression] = [:]
+    private let lock = NSLock()
+    private var cache: [Key: NSRegularExpression] = [:]
     private let maxCapacity = 128
     
     func getOrCreate(pattern: String, isCaseSensitive: Bool) throws -> NSRegularExpression {
         let key = Key(pattern: pattern, isCaseSensitive: isCaseSensitive)
+        
+        lock.lock()
         if let cached = cache[key] {
+            lock.unlock()
             return cached
         }
-        if cache.count >= maxCapacity {
-            cache.removeAll() // Clear the cache if limit is reached
-        }
+        lock.unlock()
+        
         var options: NSRegularExpression.Options = []
         if !isCaseSensitive {
             options.insert(.caseInsensitive)
         }
         let compiled = try NSRegularExpression(pattern: pattern, options: options)
+        
+        lock.lock()
+        defer { lock.unlock() }
+        if cache.count >= maxCapacity {
+            cache.removeAll() // Clear the cache if limit is reached
+        }
         cache[key] = compiled
         return compiled
     }

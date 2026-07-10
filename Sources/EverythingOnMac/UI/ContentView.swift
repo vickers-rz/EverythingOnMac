@@ -70,11 +70,35 @@ struct ContentView: View {
             }
 
             if let lastError = viewModel.lastError {
-                Text(lastError)
-                    .font(.caption)
-                    .foregroundStyle(.red)
-                    .frame(maxWidth: .infinity, alignment: .leading)
-                    .textSelection(.enabled)
+                VStack(alignment: .leading, spacing: 8) {
+                    Text(lastError.message)
+                        .font(.caption)
+                        .foregroundStyle(.red)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                        .textSelection(.enabled)
+                    
+                    if lastError.canRetryInitialization || lastError.canRebuildDatabase || lastError.canOpenDatabaseDirectory {
+                        HStack(spacing: 12) {
+                            if lastError.canRetryInitialization {
+                                Button("重试初始化") {
+                                    viewModel.retryInitialization()
+                                }
+                            }
+                            if lastError.canRebuildDatabase {
+                                Button("重建数据库并重试") {
+                                    viewModel.deleteDatabaseAndRetry()
+                                }
+                            }
+                            if lastError.canOpenDatabaseDirectory {
+                                Button("打开数据库目录") {
+                                    viewModel.openDatabaseDirectory()
+                                }
+                            }
+                        }
+                        .buttonStyle(.bordered)
+                        .controlSize(.small)
+                    }
+                }
             }
 
             List(viewModel.results, id: \.metadata.path) { result in
